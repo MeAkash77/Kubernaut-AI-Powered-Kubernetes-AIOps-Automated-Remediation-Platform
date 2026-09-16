@@ -1,0 +1,397 @@
+/*
+Copyright 2026 Jordi Gil.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+package handlers
+
+import (
+	"encoding/json"
+	"log"
+	"net/http"
+	"strings"
+	"time"
+
+	openai "github.com/jordigilh/kubernaut/pkg/shared/types/openai"
+	"github.com/jordigilh/kubernaut/test/services/mock-llm/config"
+	"github.com/jordigilh/kubernaut/test/services/mock-llm/conversation"
+	"github.com/jordigilh/kubernaut/test/services/mock-llm/response"
+	"github.com/jordigilh/kubernaut/test/services/mock-llm/scenarios"
+)
+
+func (h *handler) handleOpenAI(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+
+	if h.headerRecorder != nil {
+		h.headerRecorder.RecordFrom(r)
+	}
+
+	if h.tracker != nil {
+		h.tracker.IncrementRequestCount()
+	}
+
+	if h.faultInjector != nil && h.faultInjector.IsActive() {
+		applyFaultDelay(h.faultInjector)
+		writeJSON(w, h.faultInjector.StatusCode(),
+			response.BuildErrorResponse(h.faultInjector.Message()))
+		return
+	}
+
+	var req openai.ChatCompletionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+
+	model := req.Model
+	if model == "" {
+		model = openai.DefaultModel
+	}
+
+	ctx := conversation.NewContext(req.Messages)
+	detCtx := buildDetectionContext(ctx, req.Tools)
+
+	if isPermanentError(detCtx) {
+		writeJSON(w, http.StatusInternalServerError,
+			response.BuildErrorResponse("Mock permanent LLM error for testing"))
+		return
+	}
+
+	result := h.registry.Detect(detCtx)
+	if result == nil {
+		actionable := true
+		writeChatCompletion(w, req.Stream, response.BuildTextResponse(model, scenarios.MockScenarioConfig{
+			ScenarioName: "default", RootCause: "Unable to determine root cause", Severity: "warning",
+			InvestigationOutcome: "actionable", IsActionable: &actionable, Confidence: 0.5,
+		}))
+		h.recordRequestMetric(r.URL.Path, "default", time.Since(start).Seconds())
+		return
+	}
+
+	if h.tracker != nil {
+		h.tracker.RecordScenario(result.Scenario.Name())
+	}
+
+	cfg, ok := resolveScenarioConfig(result.Scenario, detCtx)
+	if !ok {
+		writeChatCompletion(w, req.Stream, response.BuildTextResponse(model, scenarios.MockScenarioConfig{}))
+		return
+	}
+
+	if !cfg.OverrideResource {
+		if res := ctx.ExtractResource(); res.Kind != "" && res.Name != "" {
+			cfg.ResourceName = res.Name
+			cfg.ResourceNS = res.Namespace
+		}
+	}
+
+	resolveOpenAITemplateArgs(req.Messages, &cfg)
+
+	scenarioName := cfg.ScenarioName
+	h.recordScenarioMetric(scenarioName, result.Method)
+
+	hasSplit := conversation.HasSubmitWithWorkflowTool(req.Tools)
+	hasSubmitOnly := conversation.HasSubmitResultOnly(req.Tools)
+	resolved := isResolvedOutcome(cfg)
+	log.Printf("[mock-llm] scenario=%s mode=%s outcome=%s workflowID=%q tools=%d hasSplitTool=%v hasSubmitOnly=%v isResolved=%v",
+		scenarioName, h.mode, cfg.InvestigationOutcome, cfg.WorkflowID, len(req.Tools), hasSplit, hasSubmitOnly, resolved)
+
+	if cfg.SecondTurnDelay > 0 && ctx.CountToolResults() > 0 {
+		log.Printf("[mock-llm] scenario=%s applying %v second-turn delay", scenarioName, cfg.SecondTurnDelay)
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(cfg.SecondTurnDelay):
+		}
+	}
+
+	notifySubmit := func() {
+		if notifier, ok := result.Scenario.(scenarios.ScenarioWithSubmitNotify); ok {
+			notifier.MarkSubmitSent()
+		}
+	}
+
+	// RCA extraction mode: when the only tool is submit_result, the caller
+	// wants a structured RCA (e.g. discover_workflows). Respond immediately
+	// with a submit_result tool call regardless of mode or forceText.
+	if hasSubmitOnly {
+		h.respondWithRCAExtraction(w, req.Stream, model, cfg)
+		h.recordRequestMetric(r.URL.Path, scenarioName, time.Since(start).Seconds())
+		return
+	}
+
+	switch h.mode {
+	case config.ModeInteractive:
+		h.respondWithText(w, req.Stream, model, cfg)
+
+	case config.ModeAutonomous:
+		effectiveForceText := true
+		if cfg.ForceText != nil {
+			effectiveForceText = *cfg.ForceText
+		}
+		if effectiveForceText || len(req.Tools) == 0 {
+			if hasSplit && !resolved {
+				h.respondWithSubmitToolCall(w, req.Stream, model, cfg)
+				notifySubmit()
+			} else {
+				h.respondWithText(w, req.Stream, model, cfg)
+			}
+		} else {
+			h.handleFullDAG(w, model, cfg, req, ctx, hasSplit, resolved, notifySubmit)
+		}
+
+	default: // config.ModeFull
+		effectiveForceText := h.forceText
+		if cfg.ForceText != nil {
+			effectiveForceText = *cfg.ForceText
+		}
+		if effectiveForceText || len(req.Tools) == 0 {
+			if hasSplit && !resolved {
+				h.respondWithSubmitToolCall(w, req.Stream, model, cfg)
+				notifySubmit()
+			} else {
+				h.respondWithText(w, req.Stream, model, cfg)
+			}
+		} else {
+			h.handleFullDAG(w, model, cfg, req, ctx, hasSplit, resolved, notifySubmit)
+		}
+	}
+
+	h.recordRequestMetric(r.URL.Path, scenarioName, time.Since(start).Seconds())
+}
+
+// respondWithText writes a text-only response (no tool calls).
+func (h *handler) respondWithText(w http.ResponseWriter, stream bool, model string, cfg scenarios.MockScenarioConfig) {
+	writeChatCompletion(w, stream, response.BuildTextResponse(model, cfg))
+}
+
+// respondWithRCAExtraction writes a submit_result tool call with structured RCA.
+// Used when discover_workflows triggers RCA extraction from an interactive session.
+func (h *handler) respondWithRCAExtraction(w http.ResponseWriter, stream bool, model string, cfg scenarios.MockScenarioConfig) {
+	h.trackToolCall(openai.ToolSubmitResult)
+	writeChatCompletion(w, stream, response.BuildToolCallResponse(model, openai.ToolSubmitResult, cfg))
+}
+
+// respondWithSubmitToolCall writes the appropriate submit_result tool call.
+func (h *handler) respondWithSubmitToolCall(w http.ResponseWriter, stream bool, model string, cfg scenarios.MockScenarioConfig) {
+	toolName := openai.ToolSubmitResultWithWorkflow
+	if cfg.WorkflowID == "" {
+		toolName = openai.ToolSubmitResultNoWorkflow
+	}
+	h.trackToolCall(toolName)
+	writeChatCompletion(w, stream, response.BuildToolCallResponse(model, toolName, cfg))
+}
+
+// handleFullDAG executes the complete DAG path for tool-calling scenarios.
+func (h *handler) handleFullDAG(
+	w http.ResponseWriter,
+	model string, cfg scenarios.MockScenarioConfig,
+	req openai.ChatCompletionRequest,
+	ctx *conversation.Context,
+	hasSplit, resolved bool,
+	notifySubmit func(),
+) {
+	// Guard against infinite tool-call loops (#1189): if RepeatToolCall is
+	// enabled but the last message is already a tool result (meaning we just
+	// executed the tool in this iteration), fall through to DAG/text response.
+	repeatAllowed := cfg.RepeatToolCall && !lastMessageIsToolResult(req.Messages)
+
+	if len(cfg.MultiToolCalls) > 0 && (!hasToolResults(req.Messages) || repeatAllowed) {
+		for _, tc := range cfg.MultiToolCalls {
+			h.trackToolCall(tc.Name)
+		}
+		writeChatCompletion(w, req.Stream, response.BuildMultiToolCallResponse(model, cfg.MultiToolCalls))
+		return
+	}
+
+	if cfg.ToolCallName != "" && (!hasToolResults(req.Messages) || repeatAllowed) {
+		h.trackToolCall(cfg.ToolCallName)
+		writeChatCompletion(w, req.Stream, response.BuildToolCallResponse(model, cfg.ToolCallName, cfg))
+		return
+	}
+
+	// NextToolCall chain: once N tool results exist, fire the Nth chained call
+	// (1-indexed), resolving any $from_tool templates in its arguments
+	// against the conversation so far. Generalizes the original
+	// single-NextToolCall behavior to arbitrary depth (issue #1853), e.g.
+	// investigate -> discover_workflows -> select_workflow -> watch, while
+	// preserving the original "fire at most once per link" guard: once
+	// CountToolResults() exceeds the chain length, nextChainCallByCount
+	// returns nil and this falls through to the DAG/text path below.
+	if chain := flattenToolCallChain(cfg.NextToolCall); len(chain) > 0 {
+		if next := nextChainCallByCount(chain, ctx.CountToolResults()); next != nil {
+			args := resolveTemplateArgsMap(next.Arguments, next.FallbackArguments, func(toolName, field string) string {
+				return response.ExtractFieldFromToolResult(req.Messages, toolName, field)
+			})
+			h.trackToolCall(next.Name)
+			writeChatCompletion(w, req.Stream, response.BuildToolCallResponse(model, next.Name, scenarios.MockScenarioConfig{
+				ToolCallName: next.Name,
+				ToolCallArgs: args,
+			}))
+			return
+		}
+	}
+
+	dag := conversation.SelectDAG(req.Tools)
+	execResult, err := dag.Execute(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError,
+			response.BuildErrorResponse("DAG execution error: "+err.Error()))
+		return
+	}
+
+	if h.tracker != nil {
+		h.tracker.RecordDAGPath(execResult.Path)
+	}
+	h.recordDAGTransitions(execResult.Path)
+
+	hr := execResult.Result
+	switch hr.ResponseType {
+	case conversation.StepToolCall:
+		h.trackToolCall(hr.ToolName)
+		writeChatCompletion(w, req.Stream, response.BuildToolCallResponse(model, hr.ToolName, cfg))
+	default:
+		if hasSplit && !resolved {
+			h.respondWithSubmitToolCall(w, req.Stream, model, cfg)
+			notifySubmit()
+		} else {
+			writeChatCompletion(w, req.Stream, response.BuildTextResponse(model, cfg))
+		}
+	}
+}
+
+func (h *handler) trackToolCall(name string) {
+	if h.tracker != nil {
+		h.tracker.RecordToolCall(name, "")
+	}
+}
+
+func hasToolResults(messages []openai.Message) bool {
+	for _, m := range messages {
+		if m.Role == "tool" {
+			return true
+		}
+	}
+	return false
+}
+
+// lastMessageIsToolResult returns true if the final message in the conversation
+// has role "tool", indicating we just received a tool result in this iteration.
+// Used to break infinite tool-call loops with RepeatToolCall (#1189).
+func lastMessageIsToolResult(messages []openai.Message) bool {
+	if len(messages) == 0 {
+		return false
+	}
+	return messages[len(messages)-1].Role == "tool"
+}
+
+// buildDetectionContext builds the scenario-detection input from the
+// conversation. tools carries the caller's advertised function-tool names
+// (req.Tools, OpenAI handler only) into DetectionContext.AvailableTools --
+// pass nil where no tools schema exists (Ollama handler).
+func buildDetectionContext(ctx *conversation.Context, tools []openai.Tool) *scenarios.DetectionContext {
+	var contentParts, allParts []string
+	var lastUserContent string
+	for _, m := range ctx.Messages {
+		if m.Content != nil {
+			contentParts = append(contentParts, *m.Content)
+			if m.Role == "user" {
+				lastUserContent = *m.Content
+			}
+		}
+		allParts = append(allParts, msgString(m))
+	}
+	content := strings.ToLower(strings.Join(contentParts, " "))
+	allText := strings.ToLower(strings.Join(allParts, " "))
+
+	isProactive := strings.Contains(content, "proactive mode") ||
+		strings.Contains(content, "proactive signal") ||
+		(strings.Contains(content, "predicted") && strings.Contains(content, "not yet occurred"))
+
+	var availableTools []string
+	if len(tools) > 0 {
+		availableTools = make([]string, len(tools))
+		for i, t := range tools {
+			availableTools[i] = t.Function.Name
+		}
+	}
+	caller, phase := scenarios.InferRequestScope(content, allText, lastUserContent, availableTools)
+
+	return &scenarios.DetectionContext{
+		Content:         content,
+		AllText:         allText,
+		IsProactive:     isProactive,
+		LastUserContent: lastUserContent,
+		Caller:          caller,
+		Phase:           phase,
+		AvailableTools:  availableTools,
+	}
+}
+
+// isResolvedOutcome returns true when the scenario represents a resolved or
+// non-actionable investigation that should bypass the split submit tools and
+// use a text response so the KA parser handles investigation_outcome routing.
+// resolveScenarioConfig extracts the MockScenarioConfig from a scenario,
+// preferring ScenarioWithContextConfig (thread-safe, request-scoped extraction)
+// over ScenarioWithConfig (shared state). This prevents data races when
+// concurrent requests match the same dynamic scenario instance (#1458).
+func resolveScenarioConfig(s scenarios.Scenario, detCtx *scenarios.DetectionContext) (scenarios.MockScenarioConfig, bool) {
+	if ctxCfg, ok := s.(scenarios.ScenarioWithContextConfig); ok {
+		return ctxCfg.ConfigForContext(detCtx), true
+	}
+	if swc, ok := s.(scenarios.ScenarioWithConfig); ok {
+		return swc.Config(), true
+	}
+	return scenarios.MockScenarioConfig{}, false
+}
+
+func isResolvedOutcome(cfg scenarios.MockScenarioConfig) bool {
+	switch cfg.InvestigationOutcome {
+	case "problem_resolved", "predictive_no_action":
+		return true
+	default:
+		return cfg.IsActionable != nil && !*cfg.IsActionable && cfg.WorkflowID == ""
+	}
+}
+
+func isPermanentError(ctx *scenarios.DetectionContext) bool {
+	return strings.Contains(ctx.Content, "mock_rca_permanent_error") ||
+		strings.Contains(ctx.Content, "mock rca permanent error")
+}
+
+func msgString(m openai.Message) string {
+	parts := []string{m.Role}
+	if m.Content != nil {
+		parts = append(parts, *m.Content)
+	}
+	for _, tc := range m.ToolCalls {
+		parts = append(parts, tc.Function.Name, tc.Function.Arguments)
+	}
+	return strings.Join(parts, " ")
+}
+
+// resolveOpenAITemplateArgs scans cfg.ToolCallArgs for template placeholders
+// of the form "$from_tool:<toolName>:<field>" and replaces them with values
+// extracted from prior tool result messages in the OpenAI conversation.
+// The map is cloned before mutation to avoid data races and state leaks
+// across concurrent requests sharing the same scenario singleton.
+func resolveOpenAITemplateArgs(messages []openai.Message, cfg *scenarios.MockScenarioConfig) {
+	cfg.ToolCallArgs = resolveTemplateArgsMap(cfg.ToolCallArgs, cfg.FallbackArguments, func(toolName, field string) string {
+		return response.ExtractFieldFromToolResult(messages, toolName, field)
+	})
+}

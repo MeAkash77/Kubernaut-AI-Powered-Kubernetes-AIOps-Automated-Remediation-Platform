@@ -1,0 +1,552 @@
+/*
+Copyright 2026 Jordi Gil.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package prompt
+
+import (
+	"bytes"
+	"fmt"
+	"slices"
+	"strings"
+	"text/template"
+
+	eav1 "github.com/jordigilh/kubernaut/api/effectivenessassessment/v1alpha1"
+	"github.com/jordigilh/kubernaut/internal/kubernautagent/enrichment"
+)
+
+// notAvailable is the placeholder rendered in prompt text when a value is
+// absent, inconclusive, or not populated for the given history entry.
+const notAvailable = "N/A"
+
+// RepeatedRemediationEscalationThreshold is the minimum count of completed-but-recurring
+// remediations before the LLM is warned to escalate (KA constants.py:92).
+const RepeatedRemediationEscalationThreshold = 2
+
+// completedOutcomes defines which RR outcome values indicate a remediation that
+// "completed" from the orchestrator's perspective. Used by recurring detection and
+// all-zero-effectiveness logic to identify remediations that ran to completion.
+// Issue #722: Added "Remediated" and "Inconclusive" (CRD-level outcomes).
+var completedOutcomes = map[string]bool{
+	"completed": true, "success": true, "Completed": true, "Success": true,
+	"Remediated": true, "Inconclusive": true,
+}
+
+// HistoryEntry is a unified interface for detection algorithms that operate on
+// both Tier1 and Tier2 entries (recurring detection, all-zero-effectiveness).
+type HistoryEntry struct {
+	ActionType         string
+	SignalType         string
+	Outcome            string
+	EffectivenessScore *float64
+	SignalResolved     *bool
+	AssessmentReason   string
+}
+
+// RecurringPattern holds a detected completed-but-recurring remediation pattern.
+type RecurringPattern struct {
+	ActionType string
+	Count      int
+	SignalType string
+}
+
+// remediationHistoryTemplateData matches the remediation_history.tmpl contract.
+type remediationHistoryTemplateData struct {
+	TargetResource                 string
+	RegressionDetected             bool
+	Tier1Entries                   []string
+	Tier1Window                    string
+	Tier2Entries                   []string
+	Tier2Window                    string
+	DecliningEffectivenessWarnings []string
+	RecurringRemediationWarnings   []string
+	HasSpecDrift                   bool
+}
+
+// BuildRemediationHistorySection renders the full remediation history prompt section.
+// 1:1 port of KA build_remediation_history_section().
+func BuildRemediationHistorySection(result *enrichment.RemediationHistoryResult, escalationThreshold int) string {
+	if result == nil {
+		return ""
+	}
+	if len(result.Tier1) == 0 && len(result.Tier2) == 0 {
+		return ""
+	}
+
+	causalChains := DetectSpecDriftCausalChains(result.Tier1)
+	allEntries := toHistoryEntries(result.Tier1, result.Tier2)
+
+	data := remediationHistoryTemplateData{
+		TargetResource:                 result.TargetResource,
+		RegressionDetected:             result.RegressionDetected,
+		Tier1Entries:                   renderTier1Entries(result.Tier1, causalChains),
+		Tier1Window:                    result.Tier1Window,
+		Tier2Entries:                   renderTier2Entries(result.Tier2),
+		Tier2Window:                    result.Tier2Window,
+		DecliningEffectivenessWarnings: buildDecliningEffectivenessWarnings(result.Tier1),
+		RecurringRemediationWarnings:   buildRecurringRemediationWarnings(allEntries, escalationThreshold),
+		HasSpecDrift:                   anyAssessmentReasonSpecDrift(allEntries),
+	}
+
+	return renderRemediationHistoryTemplate(data)
+}
+
+// renderTier1Entries formats each Tier1 entry for the prompt.
+func renderTier1Entries(entries []enrichment.Tier1Entry, causalChains map[string]string) []string {
+	rendered := make([]string, 0, len(entries))
+	for _, e := range entries {
+		rendered = append(rendered, FormatTier1Entry(e, causalChains))
+	}
+	return rendered
+}
+
+// renderTier2Entries formats each Tier2 summary entry for the prompt.
+func renderTier2Entries(entries []enrichment.Tier2Summary) []string {
+	rendered := make([]string, 0, len(entries))
+	for _, e := range entries {
+		rendered = append(rendered, FormatTier2Summary(e))
+	}
+	return rendered
+}
+
+// buildDecliningEffectivenessWarnings builds one warning string per
+// workflow exhibiting monotonically declining effectiveness (KA
+// _detect_declining_effectiveness()).
+func buildDecliningEffectivenessWarnings(tier1 []enrichment.Tier1Entry) []string {
+	declining := DetectDecliningEffectiveness(tier1)
+	warnings := make([]string, 0, len(declining))
+	for _, actionType := range declining {
+		warnings = append(warnings, fmt.Sprintf(
+			"**WARNING: DECLINING EFFECTIVENESS for '%s' workflow** -- "+
+				"Each successive application is less effective, suggesting the workflow "+
+				"treats the symptom rather than the root cause. Consider a different approach.",
+			actionType,
+		))
+	}
+	return warnings
+}
+
+// buildRecurringRemediationWarnings builds one warning string per detected
+// completed-but-recurring remediation pattern, escalating to a MANDATORY
+// warning when the pattern shows zero effectiveness across every occurrence.
+func buildRecurringRemediationWarnings(allEntries []HistoryEntry, escalationThreshold int) []string {
+	var warnings []string
+	for _, r := range DetectCompletedButRecurring(allEntries, escalationThreshold) {
+		if AllZeroEffectiveness(allEntries, r.ActionType, r.SignalType) {
+			warnings = append(warnings, fmt.Sprintf(
+				"**MANDATORY: You MUST NOT re-select '%s' for signal "+
+					"'%s'.** This workflow has been applied %d times with "+
+					"zero effectiveness -- the signal continues to recur. Set "+
+					"`investigation_outcome` to `inconclusive` and omit `selected_workflow`, "+
+					"or select a fundamentally different remediation approach.",
+				r.ActionType, r.SignalType, r.Count,
+			))
+		} else {
+			warnings = append(warnings, fmt.Sprintf(
+				"**WARNING: REPEATED INEFFECTIVE REMEDIATION for '%s'** -- "+
+					"Completed %d times for signal '%s' but the issue continues "+
+					"to recur. Set `investigation_outcome` to `inconclusive` and omit "+
+					"`selected_workflow`, or select an alternative approach.",
+				r.ActionType, r.Count, r.SignalType,
+			))
+		}
+	}
+	return warnings
+}
+
+// anyAssessmentReasonSpecDrift reports whether any entry was assessed as
+// spec-drift-inconclusive.
+func anyAssessmentReasonSpecDrift(entries []HistoryEntry) bool {
+	for _, e := range entries {
+		if e.AssessmentReason == eav1.AssessmentReasonSpecDrift {
+			return true
+		}
+	}
+	return false
+}
+
+// renderRemediationHistoryTemplate parses and executes the
+// remediation_history.tmpl template, returning an inline error marker string
+// (rather than an error) on failure so prompt rendering never aborts.
+func renderRemediationHistoryTemplate(data remediationHistoryTemplateData) string {
+	tmpl, err := template.ParseFS(templateFS, "templates/remediation_history.tmpl")
+	if err != nil {
+		return fmt.Sprintf("[history template error: %v]", err)
+	}
+
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, data); err != nil {
+		return fmt.Sprintf("[history render error: %v]", err)
+	}
+	return buf.String()
+}
+
+// FormatTier1Entry formats a single Tier1 detailed entry for the prompt.
+// 1:1 port of KA _format_tier1_entry().
+func FormatTier1Entry(entry enrichment.Tier1Entry, causalChains map[string]string) string {
+	completed := entry.CompletedAt.UTC().Format("2006-01-02T15:04:05Z")
+	workflow := withDefault(entry.ActionType, "unknown")
+	outcome := withDefault(entry.Outcome, "unknown")
+	signal := entry.SignalType
+
+	lines := []string{
+		fmt.Sprintf("- **Remediation %s** (%s)", entry.RemediationUID, completed),
+		fmt.Sprintf("  Workflow: %s | Outcome: %s | Signal: %s", workflow, outcome, signal),
+	}
+
+	if entry.AssessmentReason == eav1.AssessmentReasonSpecDrift {
+		if causalChains != nil {
+			if followupUID, ok := causalChains[entry.RemediationUID]; ok {
+				lines = append(lines, fmt.Sprintf(
+					"  **Assessment: INCONCLUSIVE (spec drift -- led to follow-up remediation)** -- "+
+						"The target resource spec changed after this remediation, and a subsequent "+
+						"remediation (%s) was triggered from the resulting state. This suggests "+
+						"the outcome was unstable, but the workflow may still work under different "+
+						"conditions. Use with caution.",
+					followupUID,
+				))
+				return strings.Join(lines, "\n")
+			}
+		}
+		lines = append(lines,
+			"  **Assessment: INCONCLUSIVE (spec drift)** -- The target resource spec was "+
+				"modified by an external actor during the assessment window, invalidating "+
+				"effectiveness data. This workflow may still be viable under different "+
+				"conditions. The spec change could indicate a competing controller, GitOps "+
+				"sync, or manual edit that is itself relevant to the root cause.",
+		)
+		return strings.Join(lines, "\n")
+	}
+
+	if entry.EffectivenessScore != nil {
+		level := EffectivenessLevel(entry.EffectivenessScore)
+		lines = append(lines, fmt.Sprintf("  Effectiveness: %.2f (%s)", *entry.EffectivenessScore, level))
+	}
+
+	if entry.HashMatch != "" && entry.HashMatch != "none" {
+		lines = append(lines, fmt.Sprintf("  Hash match: %s", entry.HashMatch))
+	}
+
+	if entry.SignalResolved != nil {
+		resolved := "NO"
+		if *entry.SignalResolved {
+			resolved = "YES"
+		}
+		lines = append(lines, fmt.Sprintf("  Signal resolved: %s", resolved))
+	}
+
+	if entry.HealthChecks != nil {
+		lines = append(lines, fmt.Sprintf("  Health: %s", FormatHealthChecks(entry.HealthChecks)))
+	}
+
+	if entry.MetricDeltas != nil {
+		lines = append(lines, fmt.Sprintf("  Metrics: %s", FormatMetricDeltas(entry.MetricDeltas)))
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// FormatTier2Summary formats a single Tier2 compact summary entry for the prompt.
+// 1:1 port of KA _format_tier2_entry().
+func FormatTier2Summary(entry enrichment.Tier2Summary) string {
+	completed := entry.CompletedAt.UTC().Format("2006-01-02T15:04:05Z")
+	workflow := withDefault(entry.ActionType, "unknown")
+	outcome := withDefault(entry.Outcome, "unknown")
+
+	var scoreText string
+	switch {
+	case entry.AssessmentReason == eav1.AssessmentReasonSpecDrift:
+		scoreText = "INCONCLUSIVE (spec drift)"
+	case entry.EffectivenessScore != nil:
+		level := EffectivenessLevel(entry.EffectivenessScore)
+		scoreText = fmt.Sprintf("%.2f (%s)", *entry.EffectivenessScore, level)
+	default:
+		scoreText = notAvailable
+	}
+
+	hashMatch := withDefault(entry.HashMatch, "none")
+
+	return fmt.Sprintf("- %s (%s): %s -> %s, effectiveness=%s, hashMatch=%s",
+		entry.RemediationUID, completed, workflow, outcome, scoreText, hashMatch)
+}
+
+// FormatHealthChecks formats health check results into readable text.
+// 1:1 port of KA _format_health_checks().
+func FormatHealthChecks(hc *enrichment.HealthChecks) string {
+	if hc == nil {
+		return notAvailable
+	}
+	var parts []string
+	if hc.PodRunning != nil {
+		parts = append(parts, fmt.Sprintf("pod_running=%s", boolYesNo(*hc.PodRunning)))
+	}
+	if hc.ReadinessPass != nil {
+		v := "fail"
+		if *hc.ReadinessPass {
+			v = "pass"
+		}
+		parts = append(parts, fmt.Sprintf("readiness=%s", v))
+	}
+	if hc.RestartDelta != nil {
+		parts = append(parts, fmt.Sprintf("restart_delta=%d", *hc.RestartDelta))
+	}
+	if hc.CrashLoops != nil {
+		parts = append(parts, fmt.Sprintf("crash_loops=%s", boolYesNo(*hc.CrashLoops)))
+	}
+	if hc.OomKilled != nil {
+		parts = append(parts, fmt.Sprintf("oom_killed=%s", boolYesNo(*hc.OomKilled)))
+	}
+	if hc.PendingCount != nil && *hc.PendingCount > 0 {
+		parts = append(parts, fmt.Sprintf("pending_pods=%d (scheduling/resource issue)", *hc.PendingCount))
+	}
+	if len(parts) == 0 {
+		return notAvailable
+	}
+	return strings.Join(parts, ", ")
+}
+
+// FormatMetricDeltas formats metric deltas with before->after notation.
+// 1:1 port of KA _format_metric_deltas().
+func FormatMetricDeltas(md *enrichment.MetricDeltas) string {
+	if md == nil {
+		return notAvailable
+	}
+	var parts []string
+	if md.CpuBefore != nil && md.CpuAfter != nil {
+		parts = append(parts, fmt.Sprintf("cpu: %.2f -> %.2f", *md.CpuBefore, *md.CpuAfter))
+	}
+	if md.MemoryBefore != nil && md.MemoryAfter != nil {
+		parts = append(parts, fmt.Sprintf("memory: %.1f -> %.1f", *md.MemoryBefore, *md.MemoryAfter))
+	}
+	if md.LatencyP95BeforeMs != nil && md.LatencyP95AfterMs != nil {
+		parts = append(parts, fmt.Sprintf("latency_p95: %.1fms -> %.1fms", *md.LatencyP95BeforeMs, *md.LatencyP95AfterMs))
+	}
+	if md.ErrorRateBefore != nil && md.ErrorRateAfter != nil {
+		parts = append(parts, fmt.Sprintf("error_rate: %.4f -> %.4f", *md.ErrorRateBefore, *md.ErrorRateAfter))
+	}
+	parts = append(parts, formatClusterScopedAndThroughputDeltas(md)...)
+	if len(parts) == 0 {
+		return notAvailable
+	}
+	return strings.Join(parts, ", ")
+}
+
+// formatClusterScopedAndThroughputDeltas renders the throughput backfill and
+// the 6 cluster-scoped Node/PersistentVolume metric_deltas fields (Issue
+// #193, DD-EM-005 v1.1) as human-readable before->after pairs for the LLM
+// prompt. Extracted from FormatMetricDeltas to keep that function within the
+// project's line-length convention -- pure code motion alongside the new
+// field mappings, no behavior change to the existing fields formatted above.
+func formatClusterScopedAndThroughputDeltas(md *enrichment.MetricDeltas) []string {
+	var parts []string
+	if md.ThroughputBeforeRps != nil && md.ThroughputAfterRps != nil {
+		parts = append(parts, fmt.Sprintf("throughput: %.1f -> %.1f rps", *md.ThroughputBeforeRps, *md.ThroughputAfterRps))
+	}
+	if md.NodeNotReadyBefore != nil && md.NodeNotReadyAfter != nil {
+		parts = append(parts, fmt.Sprintf("node_not_ready: %.0f -> %.0f", *md.NodeNotReadyBefore, *md.NodeNotReadyAfter))
+	}
+	if md.NodeMemoryPressureBefore != nil && md.NodeMemoryPressureAfter != nil {
+		parts = append(parts, fmt.Sprintf("node_memory_pressure: %.0f -> %.0f", *md.NodeMemoryPressureBefore, *md.NodeMemoryPressureAfter))
+	}
+	if md.NodeDiskPressureBefore != nil && md.NodeDiskPressureAfter != nil {
+		parts = append(parts, fmt.Sprintf("node_disk_pressure: %.0f -> %.0f", *md.NodeDiskPressureBefore, *md.NodeDiskPressureAfter))
+	}
+	if md.PvPhaseFailedBefore != nil && md.PvPhaseFailedAfter != nil {
+		parts = append(parts, fmt.Sprintf("pv_phase_failed: %.0f -> %.0f", *md.PvPhaseFailedBefore, *md.PvPhaseFailedAfter))
+	}
+	if md.PvPhasePendingBefore != nil && md.PvPhasePendingAfter != nil {
+		parts = append(parts, fmt.Sprintf("pv_phase_pending: %.0f -> %.0f", *md.PvPhasePendingBefore, *md.PvPhasePendingAfter))
+	}
+	if md.PvUsageRatioBefore != nil && md.PvUsageRatioAfter != nil {
+		parts = append(parts, fmt.Sprintf("pv_usage_ratio: %.2f -> %.2f", *md.PvUsageRatioBefore, *md.PvUsageRatioAfter))
+	}
+	return parts
+}
+
+// DetectDecliningEffectiveness groups Tier1 entries by actionType and checks
+// for monotonically decreasing scores across >= 3 entries.
+// 1:1 port of KA _detect_declining_effectiveness().
+func DetectDecliningEffectiveness(chain []enrichment.Tier1Entry) []string {
+	actionScores := make(map[string][]float64)
+	for _, e := range chain {
+		if e.AssessmentReason == eav1.AssessmentReasonSpecDrift {
+			continue
+		}
+		if e.ActionType != "" && e.EffectivenessScore != nil {
+			actionScores[e.ActionType] = append(actionScores[e.ActionType], *e.EffectivenessScore)
+		}
+	}
+
+	var declining []string
+	for actionType, scores := range actionScores {
+		if len(scores) < 3 {
+			continue
+		}
+		isDeclining := true
+		for i := 0; i < len(scores)-1; i++ {
+			if scores[i] <= scores[i+1] {
+				isDeclining = false
+				break
+			}
+		}
+		if isDeclining {
+			declining = append(declining, actionType)
+		}
+	}
+	slices.Sort(declining)
+	return declining
+}
+
+// DetectCompletedButRecurring finds workflows that completed successfully
+// multiple times for the same signal type across all tiers.
+// 1:1 port of KA _detect_completed_but_recurring().
+func DetectCompletedButRecurring(entries []HistoryEntry, threshold int) []RecurringPattern {
+
+	type key struct{ actionType, signalType string }
+	counts := make(map[key]int)
+
+	for _, e := range entries {
+		if e.AssessmentReason == eav1.AssessmentReasonSpecDrift {
+			continue
+		}
+		if !completedOutcomes[e.Outcome] {
+			continue
+		}
+		if e.ActionType != "" && e.SignalType != "" {
+			counts[key{e.ActionType, e.SignalType}]++
+		}
+	}
+
+	var result []RecurringPattern
+	for k, count := range counts {
+		if count >= threshold {
+			result = append(result, RecurringPattern{
+				ActionType: k.actionType,
+				Count:      count,
+				SignalType: k.signalType,
+			})
+		}
+	}
+	slices.SortFunc(result, func(a, b RecurringPattern) int {
+		if a.ActionType != b.ActionType {
+			return strings.Compare(a.ActionType, b.ActionType)
+		}
+		return strings.Compare(a.SignalType, b.SignalType)
+	})
+	return result
+}
+
+// AllZeroEffectiveness checks if all completed recurring entries for an
+// action+signal combination have zero (or nil) effectiveness and unresolved signal.
+// 1:1 port of KA _all_zero_effectiveness().
+func AllZeroEffectiveness(entries []HistoryEntry, actionType, signalType string) bool {
+
+	matched := false
+	for _, e := range entries {
+		if e.AssessmentReason == eav1.AssessmentReasonSpecDrift {
+			continue
+		}
+		if !completedOutcomes[e.Outcome] {
+			continue
+		}
+		if e.ActionType != actionType || e.SignalType != signalType {
+			continue
+		}
+		matched = true
+		if e.EffectivenessScore != nil && *e.EffectivenessScore > 0 {
+			return false
+		}
+		if e.SignalResolved != nil && *e.SignalResolved {
+			return false
+		}
+	}
+	return matched
+}
+
+// DetectSpecDriftCausalChains detects when a spec_drift entry's postRemediationSpecHash
+// matches a subsequent entry's preRemediationSpecHash.
+// 1:1 port of KA _detect_spec_drift_causal_chains().
+func DetectSpecDriftCausalChains(chain []enrichment.Tier1Entry) map[string]string {
+	preHashIndex := make(map[string]string)
+	for _, e := range chain {
+		if e.PreRemediationSpecHash != "" && e.RemediationUID != "" {
+			preHashIndex[e.PreRemediationSpecHash] = e.RemediationUID
+		}
+	}
+
+	causalMap := make(map[string]string)
+	for _, e := range chain {
+		if e.AssessmentReason != eav1.AssessmentReasonSpecDrift {
+			continue
+		}
+		if e.RemediationUID == "" || e.PostRemediationSpecHash == "" {
+			continue
+		}
+		followupUID, ok := preHashIndex[e.PostRemediationSpecHash]
+		if ok && followupUID != e.RemediationUID {
+			causalMap[e.RemediationUID] = followupUID
+		}
+	}
+	return causalMap
+}
+
+// EffectivenessLevel classifies a score into human-readable level.
+// 1:1 port of KA effectiveness_level().
+func EffectivenessLevel(score *float64) string {
+	if score == nil {
+		return "unknown"
+	}
+	if *score >= 0.7 {
+		return "good"
+	}
+	if *score >= 0.4 {
+		return "moderate"
+	}
+	return "poor"
+}
+
+func boolYesNo(v bool) string {
+	if v {
+		return "yes"
+	}
+	return "no"
+}
+
+// toHistoryEntries converts Tier1 and Tier2 entries into unified HistoryEntry slices
+// for detection algorithms that operate across both tiers.
+func toHistoryEntries(tier1 []enrichment.Tier1Entry, tier2 []enrichment.Tier2Summary) []HistoryEntry {
+	entries := make([]HistoryEntry, 0, len(tier1)+len(tier2))
+	for _, e := range tier1 {
+		entries = append(entries, HistoryEntry{
+			ActionType:         e.ActionType,
+			SignalType:         e.SignalType,
+			Outcome:            e.Outcome,
+			EffectivenessScore: e.EffectivenessScore,
+			SignalResolved:     e.SignalResolved,
+			AssessmentReason:   e.AssessmentReason,
+		})
+	}
+	for _, e := range tier2 {
+		entries = append(entries, HistoryEntry{
+			ActionType:         e.ActionType,
+			SignalType:         e.SignalType,
+			Outcome:            e.Outcome,
+			EffectivenessScore: e.EffectivenessScore,
+			SignalResolved:     e.SignalResolved,
+			AssessmentReason:   e.AssessmentReason,
+		})
+	}
+	return entries
+}

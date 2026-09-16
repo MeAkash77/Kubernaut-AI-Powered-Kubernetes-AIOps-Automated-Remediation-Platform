@@ -1,0 +1,233 @@
+# Kubernaut
+
+**AIOps Platform for Intelligent Kubernetes Remediation**
+
+[![Go Reference](https://pkg.go.dev/badge/github.com/jordigilh/kubernaut.svg)](https://pkg.go.dev/github.com/jordigilh/kubernaut)
+[![Go Version](https://img.shields.io/badge/Go-1.26-blue.svg)](https://golang.org/dl/)
+[![Kubernetes](https://img.shields.io/badge/Kubernetes-v1.32+-blue.svg)](https://kubernetes.io/)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![CI](https://github.com/jordigilh/kubernaut/actions/workflows/ci-pipeline.yml/badge.svg)](https://github.com/jordigilh/kubernaut/actions/workflows/ci-pipeline.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/jordigilh/kubernaut/badge)](https://scorecard.dev/viewer/?uri=github.com/jordigilh/kubernaut)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/13485/badge)](https://www.bestpractices.dev/projects/13485)
+[![Latest Release](https://img.shields.io/github/v/release/jordigilh/kubernaut)](https://github.com/jordigilh/kubernaut/releases/latest)
+[![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-2.1-4baaaa.svg)](CODE_OF_CONDUCT.md)
+
+Kubernaut closes the loop from Kubernetes alert to automated remediation. It operates in two modes: **autonomously** — detecting signals, investigating root causes, and executing fixes end-to-end without human involvement — and **interactively** — letting operators join an in-progress investigation via MCP or A2A, guide the agent, and approve remediations in real time. The LLM-powered agent uses native Go client-go bindings against the Kubernetes API, Prometheus, and log endpoints to investigate, select a remediation workflow, and execute the fix — or escalate to a human with a full RCA when it can't. See the **[full documentation](https://jordigilh.github.io/kubernaut-docs/)** for architecture, installation, and usage guides.
+
+<div align="center">
+  <video src="https://github.com/user-attachments/assets/b95290db-412b-4d6d-81b8-f766ef4657e2" controls width="100%"></video>
+</div>
+
+<details>
+<summary>See autonomous mode demo (non-interactive)</summary>
+<p align="center">
+  <img src="https://raw.githubusercontent.com/jordigilh/kubernaut-demo-scenarios/main/scenarios/crashloop/crashloop-lite.gif" alt="CrashLoopBackOff demo — autonomous alert-to-fix" width="800"/>
+</p>
+<p align="center">
+  This is 1 of 37 runnable scenarios in <a href="https://github.com/jordigilh/kubernaut-demo-scenarios"><strong>kubernaut-demo-scenarios</strong></a> — clone it and run any of them against your own cluster.
+</p>
+</details>
+
+---
+
+## Why
+
+Kubernetes operators spend hours manually triaging alerts, diagnosing root causes from scattered logs and metrics, and executing remediation steps from runbooks that drift out of date. The response depends on tribal knowledge, human availability, and often happens at 3am.
+
+Rule-based remediation tools help with known, deterministic problems — "if X, do Y." But when the same symptom has multiple root causes, or the right fix depends on context the rule can't see, they fall short.
+
+Kubernaut bridges that gap. It uses an LLM agent that investigates the actual root cause through native Go bindings against the Kubernetes API and observability stack, selects the right remediation from a workflow catalog, executes it, and verifies the fix worked — escalating to humans only when it should. Rule-based tools are thermostats. Kubernaut is a diagnostician that also adjusts the thermostat.
+
+**[Why Kubernaut? — full comparison with rule-based tools](https://jordigilh.github.io/kubernaut-docs/latest/getting-started/why-kubernaut/)**
+
+---
+
+## What It Can Triage & Fix
+
+Validated against [37 runnable scenarios](https://github.com/jordigilh/kubernaut-demo-scenarios) covering real-world Kubernetes failure modes:
+
+| Category | Examples |
+|---|---|
+| **Workload failures** | Crash loops, stuck rollouts, memory leaks/escalation, SLO error-budget burn |
+| **Resource & capacity** | HPA maxed out, PDB deadlocks, PVC capacity exhaustion (forecasted), DB connection pool saturation |
+| **Infrastructure** | Node failures, PVC/StatefulSet binding failures, scheduling taints, OCP operator/build/RBAC/SCC violations |
+| **Networking & delivery** | NetworkPolicy misconfigurations, Istio authorization failures, GitOps drift, cert-manager failures |
+| **Complex root-cause chains** | Cross-namespace dependency tracing, cascading multi-service failures, prioritizing causation over severity, filtering unrelated noise |
+| **Safety & reasoning robustness** | Prompt-injection detection (shadow agent), resistance to misleading alert descriptions, duplicate-alert suppression |
+
+See the [full scenario catalog](https://github.com/jordigilh/kubernaut-demo-scenarios/blob/main/docs/scenarios.md) for exact alerts, fault injection, and remediation workflows per scenario.
+
+---
+
+## What It Does
+
+- **Detects** — Ingests Prometheus AlertManager alerts and Kubernetes Events, validates resource scope, and deduplicates by fingerprint
+- **Triages** — Resolves signal severity through a multi-tier pipeline (firing alerts, Prometheus rule evaluation, LLM-based triage) and derives grounded signal names from infrastructure context
+- **Investigates** — Performs live root cause analysis using Kubernetes inspection tools, configurable observability toolsets (Prometheus, etc.), and remediation history. Runs **autonomously** end-to-end, or **interactively** with an operator guiding the investigation in real time via MCP tools or A2A sessions
+- **Integrates** — Exposes MCP and A2A (Agent-to-Agent) protocol endpoints through the API Frontend, enabling external agents, UIs, and automation to interact with Kubernaut via OIDC-authenticated sessions. Operators can take over autonomous sessions mid-flight, review findings, and approve next steps
+- **Remediates** — Selects and executes a workflow from a searchable catalog via Tekton Pipelines, Kubernetes Jobs, or Ansible (AWX/AAP), with optional human approval gates
+- **Closes the loop** — Notifies the team (Slack, webhook), evaluates whether the fix worked via health checks, alert resolution, and spec hash drift detection, and feeds effectiveness scores back into future investigations
+
+<details>
+<summary>Architecture</summary>
+
+![Kubernaut Remediation Pipeline](https://raw.githubusercontent.com/jordigilh/kubernaut-docs/main/docs/assets/images/pipeline-phases.svg)
+
+See the interactive version with per-phase detail: [How It Works](https://jordigilh.github.io/kubernaut-docs/latest/#how-it-works).
+
+</details>
+
+<details>
+<summary>Services</summary>
+
+| Service | Path | Description |
+|---|---|---|
+| **Gateway** | `cmd/gateway` | Signal ingestion — AlertManager webhooks and Kubernetes Events |
+| **Signal Processing** | `cmd/signalprocessing` | Signal enrichment, deduplication, and routing |
+| **Remediation Orchestrator** | `cmd/remediationorchestrator` | CRD lifecycle orchestration across the pipeline |
+| **AI Analysis** | `cmd/aianalysis` | Investigation controller — dispatches to Kubernaut Agent |
+| **Kubernaut Agent** | `cmd/kubernautagent` | LLM-powered RCA, workflow selection, and MCP tool execution |
+| **API Frontend** | `cmd/apifrontend` | External protocol layer — MCP, A2A, OIDC auth, severity triage |
+| **Workflow Execution** | `cmd/workflowexecution` | Tekton Pipeline / Job / Ansible execution engine |
+| **Data Storage** | `cmd/datastorage` | Workflow catalog, audit trail, and persistence (PostgreSQL) |
+| **Notification** | `cmd/notification` | Slack, webhook, and console notification delivery |
+| **Effectiveness Monitor** | `cmd/effectivenessmonitor` | Post-remediation health checks and effectiveness scoring |
+| **Auth Webhook** | `cmd/authwebhook` | Kubernetes authentication webhook for service identity |
+| **Fleet Metadata Cache** | `cmd/fleetmetadatacache` | Multi-cluster metadata cache for cross-cluster workflow targeting |
+
+</details>
+
+---
+
+## Try It Out
+
+Don't have a cluster yet? Follow the
+[Fleet Demo Quick Start](docs/operations/deployment/FLEET_DEMO_QUICKSTART.md) to spin up
+a self-contained hub+spoke Kind environment, install Kubernaut, and run a real
+fault-injection demo scenario yourself. All you need is an LLM provider API key, ~16 GB
+of memory, 4 CPU cores, and ~50 GB of disk space.
+
+For the simpler single-cluster demo, run the one-command local setup (the executable
+defaults to `-mode=local`):
+
+```bash
+make setup-local-demo-infra \
+  LLM_PROVIDER=openai_compatible \
+  LLM_MODEL=gpt-4o \
+  LLM_ENDPOINT=https://api.openai.com/v1 \
+  LLM_CREDENTIALS_FILE=~/.secrets/llm-api-key.txt
+```
+
+This creates one Kind cluster, installs Keycloak, Traefik, Kubernaut, and the Console,
+while leaving fleet disabled. The setup command prints the Console URL/login, kubeconfig,
+and the next commands for running scenarios from `kubernaut-demo-scenarios`.
+
+To test images built outside the release repository, pass their common image base path and
+tag, for example `IMAGE_REPOSITORY=quay.io/jordigilh IMAGE_TAG=dev`.
+
+---
+
+## Installation
+
+Pick the guide for your platform — both are production-ready deployment paths.
+
+New to Kubernaut? Start with the Helm chart's [Quick Start](charts/kubernaut/README.md#quick-start) — namespace, three credential Secrets (PostgreSQL, Valkey, and an LLM provider API key), two Rego policies, and one `helm install`.
+
+| Platform | Method | Guide |
+|---|---|---|
+| Vanilla Kubernetes (non-OpenShift) | Helm chart | [charts/kubernaut/README.md](charts/kubernaut/README.md) |
+| OpenShift | Operator (OLM) | [kubernaut-operator installation guide](https://github.com/jordigilh/kubernaut-operator/blob/main/docs/installation/00-quickstart.md) |
+
+Each method's guide lives alongside its own code, so it stays current without a cross-repo docs update.
+
+Once installed, pick a setup guide for how you want to trigger remediation — the three are
+independent and can be combined on the same install:
+
+| Mode | Trigger | Guide |
+|---|---|---|
+| Autonomous | Alert-driven (Prometheus/AlertManager → Gateway) | [Autonomous Mode Setup Guide](docs/operations/deployment/AUTONOMOUS_MODE_SETUP_GUIDE.md) |
+| Interactive | Chat-driven (Console/APIFrontend, human-in-the-loop) | [Interactive Mode Setup Guide](docs/operations/deployment/INTERACTIVE_MODE_SETUP_GUIDE.md) |
+| Fleet | Multi-cluster (hub + spoke, layers onto either mode above) | [Fleet Setup Guide](docs/operations/deployment/FLEET_SETUP_GUIDE.md) |
+
+---
+
+## Signed & Verified
+
+Every container image published to `quay.io/kubernaut-ai` is keylessly signed with
+[Cosign](https://github.com/sigstore/cosign) (Sigstore/Fulcio/Rekor) and carries a
+[SLSA build provenance](https://slsa.dev/) attestation plus a CycloneDX SBOM attestation,
+generated entirely inside GitHub Actions via OIDC — no long-lived signing keys involved.
+See [`.github/workflows/release.yml`](.github/workflows/release.yml) for the full pipeline.
+
+Verify any image before you pull it:
+
+```bash
+# Resolve the latest published release. GitHub's `releases/latest` endpoint always
+# excludes drafts and pre-releases, so this never resolves to an -rcN build.
+VERSION=$(curl -fsSL https://api.github.com/repos/jordigilh/kubernaut/releases/latest | grep -o '"tag_name": *"[^"]*"' | cut -d'"' -f4)
+
+# Verify the signature (keyless, tied to this repo's release workflow)
+cosign verify quay.io/kubernaut-ai/gateway:${VERSION} \
+  --certificate-identity-regexp "https://github.com/jordigilh/kubernaut/.github/workflows/release.yml@.*" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+
+# Verify the SLSA build provenance attestation
+cosign verify-attestation quay.io/kubernaut-ai/gateway:${VERSION} \
+  --type slsaprovenance \
+  --certificate-identity-regexp "https://github.com/jordigilh/kubernaut/.github/workflows/release.yml@.*" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+```
+
+Security posture is tracked continuously via [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/jordigilh/kubernaut)
+(badge above) and [CodeQL](.github/workflows/codeql.yml) static analysis. Found a vulnerability? See [SECURITY.md](SECURITY.md) for our disclosure process.
+
+---
+
+## Documentation
+
+| Resource | Link |
+|---|---|
+| **User & Operator Guide** | [jordigilh.github.io/kubernaut-docs](https://jordigilh.github.io/kubernaut-docs/) |
+| **Architecture Overview** | [Architecture](https://jordigilh.github.io/kubernaut-docs/latest/getting-started/architecture-overview/) |
+| **Developer Guide** | [docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md) |
+| **Must-Gather Diagnostics** | [cmd/must-gather/README.md](cmd/must-gather/README.md) |
+
+---
+
+## Related Repositories
+
+| Repository | Description |
+|---|---|
+| [kubernaut-operator](https://github.com/jordigilh/kubernaut-operator) | OLM operator — deploys and manages Kubernaut services on OpenShift |
+| [kubernaut-console](https://github.com/jordigilh/kubernaut-console) | Kubernaut Console — web UI for interactive investigation and remediation |
+| [kubernaut-docs](https://github.com/jordigilh/kubernaut-docs) | Documentation website (MkDocs Material) |
+| [kubernaut-demo-scenarios](https://github.com/jordigilh/kubernaut-demo-scenarios) | Demo scenarios, scripts, and recordings |
+
+---
+
+## Roadmap
+
+### v1.6 — Fleet Operations (release candidate)
+
+- **Fleet operations** — Multi-cluster remediation orchestration through a pluggable scope-checking adapter: Red Hat ACM/OCM for ACM shops, or a control-plane-free mode backed by the built-in Fleet Metadata Cache (FMC) for GitOps and standalone clusters — with Rancher and Clusterpedia adapters architected for other vendor fleet platforms ([#54](https://github.com/jordigilh/kubernaut/issues/54))
+- **ServiceNow incident triage** (v1.6.1) — Consume ServiceNow incidents as signals through the API Frontend, enabling Kubernaut to investigate and remediate ITSM tickets alongside Kubernetes alerts ([#1338](https://github.com/jordigilh/kubernaut/issues/1338))
+
+**[Full roadmap](docs/roadmap/ROADMAP.md)** — for released features, see the [CHANGELOG](CHANGELOG.md).
+
+---
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines. In short: create a feature branch, implement with tests, update docs, and open a PR.
+
+---
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).
+
+---
+
+**Website**: [kubernaut.ai](https://kubernaut.ai) · **Issues**: [GitHub Issues](https://github.com/jordigilh/kubernaut/issues) · **Discussions**: [GitHub Discussions](https://github.com/jordigilh/kubernaut/discussions)
+
+**Kubernaut** — From alert to remediation, intelligently.

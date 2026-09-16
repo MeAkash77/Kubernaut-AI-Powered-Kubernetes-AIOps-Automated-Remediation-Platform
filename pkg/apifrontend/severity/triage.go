@@ -1,0 +1,572 @@
+package severity
+
+import (
+	"context"
+	"errors"
+
+	"github.com/go-logr/logr"
+
+	"github.com/jordigilh/kubernaut/pkg/apifrontend/audit"
+	prom "github.com/jordigilh/kubernaut/pkg/apifrontend/prometheus"
+)
+
+const fleetClusterLabelKey = "cluster"
+
+// ErrSeverityUndetermined is returned when no real Prometheus alert or rule
+// correlates to the investigated resource (Tier 1/1.5/2/2.5 all miss).
+//
+// #1839: this used to fall through to a "Tier 3" pure-LLM classification
+// that asked the model to invent a severity from namespace/kind/name/
+// description alone -- zero confirming evidence. That value fed directly
+// into RemediationRequest.Spec.Severity (with SignalType "alert" hardcoded
+// regardless of tier, making it indistinguishable from a real
+// Alertmanager-sourced signal) and drove KA's workflow-catalog severity
+// filter. An LLM has no grounds to reconstruct alert semantics that only
+// exist in real, user-authored Prometheus rules, so a wrong guess could
+// steer remediation toward the wrong workflow. Failing closed instead of
+// guessing is the fix; see DD-AF-010.
+var ErrSeverityUndetermined = errors.New("cannot determine severity: no active alert or prometheus rule correlates to this resource")
+
+// AmbiguousSeverityError is returned by Triage when the only correlating
+// evidence found is a cluster-scoped alert with no verified relationship to
+// the target resource (DD-AF-012, #2027/#2028). Unlike ErrSeverityUndetermined
+// (no evidence at all), here a candidate exists but trusting it silently
+// risks attributing an unrelated cluster-wide incident to this resource --
+// the caller must surface Candidate to the user and re-call with a matching
+// TriageInput.ConfirmedSignalName to proceed.
+type AmbiguousSeverityError struct {
+	Candidate TriageResult
+}
+
+func (e *AmbiguousSeverityError) Error() string {
+	return "severity triage ambiguous: only a cluster-scoped alert (" + e.Candidate.AlertName + ") correlates, with no verified relationship to this resource"
+}
+
+// LLMTriager defines the interface for LLM-based severity classification.
+type LLMTriager interface {
+	TriageWithRules(ctx context.Context, rules []prom.Rule, input TriageInput) (TriageResult, error)
+}
+
+// Config holds configuration for the triage pipeline.
+type Config struct {
+	Enabled           bool
+	MaxQueriesPerCall int
+	MaxRulesEvaluated int
+	CacheTTLSeconds   int
+	LLMConfidence     float64
+}
+
+// DefaultConfig returns the default triage config.
+func DefaultConfig() Config {
+	return Config{
+		Enabled:           true,
+		MaxQueriesPerCall: 10,
+		MaxRulesEvaluated: 100,
+		CacheTTLSeconds:   30,
+		LLMConfidence:     0.7,
+	}
+}
+
+// Triager orchestrates the multi-tier severity triage pipeline.
+type Triager struct {
+	promClient  prom.Client
+	llm         LLMTriager
+	config      Config
+	logger      logr.Logger
+	cache       *RulesCache
+	auditor     audit.Emitter
+	podResolver PodResolver
+}
+
+// TriagerOption configures optional dependencies on Triager.
+type TriagerOption func(*Triager)
+
+// WithAuditor injects an audit.Emitter for SOC2 AU-2 compliance.
+func WithAuditor(e audit.Emitter) TriagerOption {
+	return func(t *Triager) { t.auditor = e }
+}
+
+// WithPodResolver injects a PodResolver for workload-to-pod correlation in Tier 1.
+// When set, Triage() auto-resolves pod names before running the pipeline.
+func WithPodResolver(r PodResolver) TriagerOption {
+	return func(t *Triager) { t.podResolver = r }
+}
+
+// NewTriager creates a new Triager instance.
+// Panics if llm is nil — Tier 2.5 requires an LLM to interpret a correlated
+// but not-currently-true Prometheus rule.
+func NewTriager(promClient prom.Client, llm LLMTriager, cfg Config, logger logr.Logger, opts ...TriagerOption) *Triager {
+	if llm == nil {
+		panic("NewTriager: LLMTriager must not be nil — Tier 2.5 requires an LLM to interpret rule context")
+	}
+	if logger.GetSink() == nil {
+		logger = logr.Discard()
+	}
+	t := &Triager{
+		promClient: promClient,
+		llm:        llm,
+		config:     cfg,
+		logger:     logger,
+		cache:      NewRulesCache(cfg.CacheTTLSeconds),
+	}
+	for _, o := range opts {
+		o(t)
+	}
+	return t
+}
+
+// Triage runs the severity triage pipeline: Tier 1 -> 1.5 -> 2 -> 2.5.
+// Returns a zero TriageResult if triage is disabled. Returns
+// ErrSeverityUndetermined if no real alert or rule correlates to the
+// resource (#1839 -- no ungrounded LLM fallback).
+func (t *Triager) Triage(ctx context.Context, input TriageInput) (TriageResult, error) {
+	if !t.config.Enabled {
+		return TriageResult{}, nil
+	}
+
+	if len(input.PodNames) == 0 && t.podResolver != nil {
+		pods, err := t.podResolver.ResolvePodNames(ctx, input.Namespace, input.Kind, input.Name)
+		if err != nil {
+			t.logger.Info("pod resolution failed, continuing without pod correlation", "error", err.Error())
+		} else {
+			input.PodNames = pods
+		}
+	}
+
+	result, err := t.triagePipeline(ctx, input)
+	if err != nil {
+		if t.auditor != nil {
+			t.auditor.Emit(ctx, &audit.Event{
+				Type: audit.EventSeverityTriageFailed,
+				Detail: map[string]string{
+					"namespace": input.Namespace,
+					"kind":      input.Kind,
+					"name":      input.Name,
+					"error":     err.Error(),
+				},
+			})
+		}
+		return result, err
+	}
+
+	// DD-AF-012/#2027/#2028: a cluster-scoped-only match is a guess, not a
+	// fact -- fail closed unless the caller already carries the user's
+	// confirmation for this exact candidate (a different candidate does not
+	// bypass the gate, even on a later call).
+	if result.Ambiguous && result.AlertName != input.ConfirmedSignalName {
+		if t.auditor != nil {
+			t.auditor.Emit(ctx, &audit.Event{
+				Type: audit.EventSeverityTriageAmbiguous,
+				Detail: map[string]string{
+					"namespace":          input.Namespace,
+					"kind":               input.Kind,
+					"name":               input.Name,
+					"candidate_alert":    result.AlertName,
+					"candidate_severity": result.Severity,
+				},
+			})
+		}
+		return result, &AmbiguousSeverityError{Candidate: result}
+	}
+
+	if result.Severity != "" {
+		result.Severity = NormalizeSeverity(result.Severity)
+	}
+	if result.Severity != "" && t.auditor != nil {
+		t.auditor.Emit(ctx, &audit.Event{
+			Type: audit.EventSeverityTriageCompleted,
+			Detail: map[string]string{
+				"namespace": input.Namespace,
+				"kind":      input.Kind,
+				"name":      input.Name,
+				"severity":  result.Severity,
+				"source":    string(result.Source),
+			},
+		})
+	}
+	return result, nil
+}
+
+func (t *Triager) triagePipeline(ctx context.Context, input TriageInput) (TriageResult, error) {
+	if err := ctx.Err(); err != nil {
+		return TriageResult{}, err
+	}
+
+	// Tier 1: Check firing alerts
+	result, done := t.runTier1(ctx, input)
+	if done {
+		return result, nil
+	}
+
+	if err := ctx.Err(); err != nil {
+		return TriageResult{}, err
+	}
+
+	// Fetch rules (cached or fresh) — shared by Tier 1.5 and Tier 2
+	ruleGroups, rulesErr := t.fetchRules(ctx)
+
+	// Tier 1.5: Check pending alerts from rules
+	if rulesErr == nil {
+		result, done = t.runTier15(input, ruleGroups)
+		if done {
+			return result, nil
+		}
+	} else {
+		t.logger.Info("skipping Tier 1.5: rules fetch failed", "error", rulesErr.Error())
+	}
+
+	// Tier 2: Evaluate inactive matching rules
+	var matchedRules []prom.Rule
+	if rulesErr == nil {
+		result, matchedRules, done = t.runTier2(ctx, input, ruleGroups)
+		if done {
+			return result, nil
+		}
+	} else {
+		t.logger.Info("skipping Tier 2: rules fetch failed", "error", rulesErr.Error())
+	}
+
+	// Tier 2.5: LLM with rule context (only if rules matched but data was empty)
+	if len(matchedRules) > 0 {
+		result, done = t.runTier25(ctx, input, matchedRules)
+		if done {
+			return result, nil
+		}
+	}
+
+	// #1839: no real alert or rule correlates to this resource -- fail
+	// closed rather than asking the LLM to invent a severity from zero
+	// evidence (removed Tier 3; see ErrSeverityUndetermined).
+	return TriageResult{}, ErrSeverityUndetermined
+}
+
+func (t *Triager) runTier1(ctx context.Context, input TriageInput) (TriageResult, bool) {
+	if len(input.Labels) == 0 {
+		return TriageResult{}, false
+	}
+
+	alerts, err := t.promClient.GetAlerts(ctx)
+	if err != nil {
+		t.logger.Info("Tier 1 failed, continuing", "error", err.Error())
+		return TriageResult{}, false
+	}
+
+	podNameSet := make(map[string]struct{}, len(input.PodNames))
+	for _, pn := range input.PodNames {
+		podNameSet[pn] = struct{}{}
+	}
+
+	return t.bestOverallMatch(alerts, input.Labels, podNameSet, input.Namespace, input.ClusterID)
+}
+
+// matchCandidate tracks the best alert match at a given priority tier.
+type matchCandidate struct {
+	found    bool
+	severity string
+	alert    string
+}
+
+func (m *matchCandidate) update(sev, alertName string) {
+	if !m.found || CompareSeverity(sev, m.severity) > 0 {
+		m.found = true
+		m.severity = sev
+		m.alert = alertName
+	}
+}
+
+func (m *matchCandidate) result(source Source) TriageResult {
+	return TriageResult{
+		Severity:  m.severity,
+		Source:    source,
+		AlertName: m.alert,
+	}
+}
+
+// bestOverallMatch scans all firing/pending alerts once and returns the
+// single best match across both specificity (resource > namespace >
+// cluster) and state (firing > pending), with specificity taking strict
+// priority over state (#2018/#2021): a resource- or namespace-scoped alert
+// -- even only "pending" -- must never lose to a cluster-scoped alert
+// merely because the cluster alert happens to be "firing".
+//
+// Before this fix, runTier1 ran two sequential full-fallback passes (firing
+// first, then pending only if firing found nothing at all). A persistently
+// firing, unrelated cluster-scoped alert (no namespace label) would win the
+// firing pass's cluster slot and return immediately -- before ever reaching
+// the pending pass, where the *actual* target's own alert might have been
+// found via resourceBest/nsBest but simply hadn't started firing yet.
+//
+// Within a single tier (resource, namespace, or cluster), firing still
+// beats pending -- only the cross-tier priority changed.
+// alertTier identifies which specificity bucket an alert was classified into.
+type alertTier int
+
+const (
+	tierNone alertTier = iota
+	tierResource
+	tierNamespace
+	tierCluster
+)
+
+// classifyAlertTier determines the specificity tier and firing/pending state
+// of a single alert, without mutating any shared state. Split out of
+// bestOverallMatch to keep the latter's cyclomatic complexity below the
+// gocyclo threshold (Issue #1532 baseline).
+func classifyAlertTier(alert prom.Alert, targetLabels map[string]string, podNameSet map[string]struct{}, targetNamespace string) (tier alertTier, firing bool, sev, name string) {
+	switch alert.State {
+	case "firing":
+		firing = true
+	case "pending":
+		firing = false
+	default:
+		return tierNone, false, "", ""
+	}
+	sev = alert.Labels["severity"]
+	name = alert.Labels["alertname"]
+
+	switch {
+	case labelsOverlap(alert.Labels, targetLabels, podNameSet, targetNamespace):
+		tier = tierResource
+	case targetNamespace != "" && alert.Labels["namespace"] == targetNamespace:
+		tier = tierNamespace
+	case alert.Labels["namespace"] == "":
+		tier = tierCluster
+	default:
+		tier = tierNone
+	}
+	return tier, firing, sev, name
+}
+
+// updateTierCandidate records sev/name into the firing or pending candidate
+// for a tier, keeping the highest-severity match seen so far (matchCandidate.update).
+func updateTierCandidate(firing bool, sev, name string, firingCand, pendingCand *matchCandidate) {
+	if firing {
+		firingCand.update(sev, name)
+	} else {
+		pendingCand.update(sev, name)
+	}
+}
+
+func (t *Triager) bestOverallMatch(alerts []prom.Alert, targetLabels map[string]string, podNameSet map[string]struct{}, targetNamespace, clusterID string) (TriageResult, bool) {
+	var resourceFiring, resourcePending, nsFiring, nsPending, clusterFiring, clusterPending matchCandidate
+
+	for _, alert := range alerts {
+		if !matchesCluster(alert.Labels, clusterID) {
+			continue
+		}
+		tier, firing, sev, name := classifyAlertTier(alert, targetLabels, podNameSet, targetNamespace)
+		switch tier {
+		case tierResource:
+			updateTierCandidate(firing, sev, name, &resourceFiring, &resourcePending)
+		case tierNamespace:
+			updateTierCandidate(firing, sev, name, &nsFiring, &nsPending)
+		case tierCluster:
+			updateTierCandidate(firing, sev, name, &clusterFiring, &clusterPending)
+		case tierNone:
+			// Alert matched no tier (or an unrecognized state) -- ignored.
+		}
+	}
+
+	switch {
+	case resourceFiring.found:
+		return resourceFiring.result(SourceFiringAlert), true
+	case resourcePending.found:
+		return resourcePending.result(SourcePendingAlert), true
+	case nsFiring.found:
+		return nsFiring.result(SourceNSFiringAlert), true
+	case nsPending.found:
+		return nsPending.result(SourceNSPendingAlert), true
+	case clusterFiring.found:
+		result := clusterFiring.result(SourceClusterFiringAlert)
+		result.Ambiguous = true
+		return result, true
+	case clusterPending.found:
+		result := clusterPending.result(SourceClusterPendingAlert)
+		result.Ambiguous = true
+		return result, true
+	}
+	return TriageResult{}, false
+}
+
+func (t *Triager) runTier15(input TriageInput, ruleGroups []prom.RuleGroup) (TriageResult, bool) {
+	var bestSeverity string
+	var bestRule string
+	for _, g := range ruleGroups {
+		for _, r := range g.Rules {
+			if r.State != "pending" {
+				continue
+			}
+			if !matchesCluster(r.Labels, input.ClusterID) {
+				continue
+			}
+			matchers, err := prom.ExtractLabelMatchers(r.Query)
+			if err != nil {
+				continue
+			}
+			if !prom.MatchesResource(matchers, input.Labels) {
+				continue
+			}
+			sev := r.Labels["severity"]
+			if bestSeverity == "" || CompareSeverity(sev, bestSeverity) > 0 {
+				bestSeverity = sev
+				bestRule = r.Name
+			}
+		}
+	}
+	if bestSeverity != "" {
+		return TriageResult{
+			Severity: bestSeverity,
+			Source:   SourcePendingAlert,
+			RuleName: bestRule,
+		}, true
+	}
+	return TriageResult{}, false
+}
+
+func (t *Triager) runTier2(ctx context.Context, input TriageInput, ruleGroups []prom.RuleGroup) (TriageResult, []prom.Rule, bool) {
+	var matchedRules []prom.Rule
+	queryCount := 0
+
+	for _, g := range ruleGroups {
+		for _, r := range g.Rules {
+			if len(matchedRules) >= t.config.MaxRulesEvaluated {
+				break
+			}
+			result, matched, found := t.evaluateTier2Rule(ctx, r, input, &queryCount)
+			if !matched {
+				continue
+			}
+			matchedRules = append(matchedRules, r)
+			if found {
+				return result, matchedRules, true
+			}
+		}
+	}
+	return TriageResult{}, matchedRules, false
+}
+
+// evaluateTier2Rule checks whether a single Prometheus alerting rule
+// correlates with input (Tier 2 label-matcher correlation), and if so,
+// queries its expression to see if it is currently firing. matched
+// indicates the rule should be recorded in matchedRules regardless of
+// query outcome; found indicates a firing match was found and result is
+// populated with the resolved severity.
+func (t *Triager) evaluateTier2Rule(ctx context.Context, r prom.Rule, input TriageInput, queryCount *int) (result TriageResult, matched, found bool) {
+	if r.State != "inactive" {
+		return TriageResult{}, false, false
+	}
+	matchers, err := prom.ExtractLabelMatchers(r.Query)
+	if err != nil {
+		return TriageResult{}, false, false
+	}
+	if !matchesCluster(r.Labels, input.ClusterID) {
+		return TriageResult{}, false, false
+	}
+	if !prom.MatchesResource(matchers, input.Labels) {
+		return TriageResult{}, false, false
+	}
+
+	if *queryCount >= t.config.MaxQueriesPerCall {
+		return TriageResult{}, true, false
+	}
+	*queryCount++
+
+	qr, qErr := t.promClient.InstantQuery(ctx, r.Query)
+	if qErr != nil {
+		t.logger.Info("Tier 2 query failed", "rule", r.Name, "error", qErr.Error())
+		return TriageResult{}, true, false
+	}
+	if len(qr.Samples) == 0 {
+		return TriageResult{}, true, false
+	}
+
+	return TriageResult{
+		Severity: r.Labels["severity"],
+		Source:   SourceRuleEval,
+		RuleName: r.Name,
+	}, true, true
+}
+
+// matchesCluster enforces Thanos cluster attribution for fleet triage. An
+// empty target cluster preserves hub-local behavior; a fleet target requires
+// an explicit matching cluster label rather than accepting un-attributed data.
+func matchesCluster(labels map[string]string, clusterID string) bool {
+	if clusterID == "" {
+		return true
+	}
+	return labels[fleetClusterLabelKey] == clusterID
+}
+
+func (t *Triager) runTier25(ctx context.Context, input TriageInput, matchedRules []prom.Rule) (TriageResult, bool) {
+	result, err := t.llm.TriageWithRules(ctx, matchedRules, input)
+	if err != nil {
+		t.logger.Info("Tier 2.5 LLM failed", "error", err.Error())
+		return TriageResult{}, false
+	}
+	result.Source = SourceLLMRuleInform
+	if result.Confidence > 0 && result.Confidence < t.config.LLMConfidence {
+		t.logger.Info("LLM confidence below threshold, defaulting to warning",
+			"tier", "2.5", "confidence", result.Confidence, "threshold", t.config.LLMConfidence)
+		result.Severity = SeverityWarning
+	}
+	return result, true
+}
+
+func (t *Triager) fetchRules(ctx context.Context) ([]prom.RuleGroup, error) {
+	if cached := t.cache.Get(); cached != nil {
+		return cached, nil
+	}
+	groups, err := t.promClient.GetRules(ctx)
+	if err != nil {
+		return nil, err
+	}
+	t.cache.Set(groups)
+	return groups, nil
+}
+
+// labelsOverlap returns true if the alert correlates with the target resource.
+//
+// Two correlation paths are checked in order:
+//
+// 1. Key overlap: every key present in both maps (excluding "namespace") must
+// have equal values, and at least one such key must exist. This is the
+// original path for alerts that carry kind/name labels.
+//
+// 2. Pod-based correlation (fallback): if key overlap finds no match AND
+// podNames is non-empty, checks whether alert.Labels["pod"] matches any
+// resolved pod name. Requires alert.Labels["namespace"] == targetNamespace
+// to prevent cross-namespace false matches (M3).
+//
+// The "namespace" key is excluded from key-overlap comparison because the
+// signal source (Prometheus alert) fires in the workload namespace (e.g.,
+// "default"), while the RR is created in AF's operational namespace (e.g.,
+// "kubernaut-system").
+func labelsOverlap(alertLabels, targetLabels map[string]string, podNameSet map[string]struct{}, targetNamespace string) bool {
+	matched := 0
+	for k, v := range targetLabels {
+		if k == "namespace" {
+			continue
+		}
+		if alertVal, exists := alertLabels[k]; exists {
+			if alertVal != v {
+				return false
+			}
+			matched++
+		}
+	}
+	if matched > 0 {
+		return true
+	}
+
+	if len(podNameSet) > 0 {
+		alertPod := alertLabels["pod"]
+		alertNS := alertLabels["namespace"]
+		if alertPod != "" && alertNS == targetNamespace {
+			if _, ok := podNameSet[alertPod]; ok {
+				return true
+			}
+		}
+	}
+
+	return false
+}

@@ -1,0 +1,229 @@
+package e2e_test
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	"k8s.io/client-go/kubernetes"
+	k8sscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/clientcmd"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	investigationsessionv1alpha1 "github.com/jordigilh/kubernaut/api/investigationsession/v1alpha1"
+	remediationv1alpha1 "github.com/jordigilh/kubernaut/api/remediation/v1alpha1"
+	kinfra "github.com/jordigilh/kubernaut/test/infrastructure"
+	"github.com/jordigilh/kubernaut/test/shared/helpers"
+)
+
+func TestE2E(t *testing.T) {
+	RegisterFailHandler(Fail)
+	RunSpecs(t, "E2E Suite — AF + KA + DS Integration")
+}
+
+const (
+	e2eClusterName = "apifrontend-e2e"
+	e2eNamespace   = "kubernaut-system"
+)
+
+var (
+	setupSucceeded bool
+	anyTestFailed  bool
+	kubeconfigPath string
+	k8sClient      client.Client
+	clientset      *kubernetes.Clientset
+)
+
+var _ = ReportAfterEach(func(report SpecReport) {
+	if report.Failed() {
+		anyTestFailed = true
+		kinfra.MarkTestFailure(e2eClusterName)
+	}
+})
+
+var _ = SynchronizedBeforeSuite(
+	func() []byte {
+		homeDir, err := os.UserHomeDir()
+		Expect(err).NotTo(HaveOccurred())
+		kubeconfigPath = fmt.Sprintf("%s/.kube/apifrontend-e2e-config", homeDir)
+
+		if os.Getenv("AF_E2E_SKIP_INFRA") == trueFixture {
+			_, _ = fmt.Fprintln(GinkgoWriter, "Skipping infra deployment (AF_E2E_SKIP_INFRA=true)")
+			setupSucceeded = true
+			return []byte(kubeconfigPath)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+		defer cancel()
+
+		err = kinfra.SetupAPIFrontendE2EInfrastructure(ctx, e2eClusterName, kubeconfigPath, e2eNamespace, GinkgoWriter)
+		Expect(err).NotTo(HaveOccurred(), "E2E infrastructure setup failed")
+
+		if os.Getenv("AF_E2E_SKIP_PROMETHEUS") != trueFixture {
+			_, _ = fmt.Fprintln(GinkgoWriter, "\nDeploying Prometheus for severity triage testing...")
+			err = kinfra.DeployPrometheusForSeverityTriage(ctx, e2eNamespace, kubeconfigPath, GinkgoWriter)
+			Expect(err).NotTo(HaveOccurred(), "Prometheus deployment must succeed for severity triage tests")
+
+			promURL := "http://localhost:9190"
+
+			_, _ = fmt.Fprintln(GinkgoWriter, "  Waiting for Prometheus readiness...")
+			Expect(kinfra.WaitForPrometheusReady(ctx, promURL, 90*time.Second, GinkgoWriter)).
+				To(Succeed(), "Prometheus must become ready within 90s")
+
+			_, _ = fmt.Fprintln(GinkgoWriter, "  Injecting OTLP metrics for severity triage alerts...")
+			// #1839: dedicated namespaces (not "default") so these fixtures
+			// cannot accidentally backstop an unrelated test that shares the
+			// "default" namespace but forgot to configure its own grounding
+			// (see apifrontend_prometheus_e2e.go's SeverityTriageAlertRulesYAML).
+			Expect(kinfra.AFInjectOTLPMetrics(ctx, promURL, "e2e_cpu_usage_percent", 95, map[string]string{
+				"namespace": "sev-tier1-ns", "kind": "Deployment", "name": "test-firing-target",
+			})).To(Succeed(), "CPU metric injection must succeed")
+			Expect(kinfra.AFInjectOTLPMetrics(ctx, promURL, "e2e_memory_usage_percent", 90, map[string]string{
+				"namespace": "sev-tier15-ns", "kind": "Deployment", "name": "test-pending-target",
+			})).To(Succeed(), "Memory metric injection must succeed")
+
+			// NOTE: e2e_disk_usage_percent is NOT injected here — injected at test
+			// time in TC-E2E-SEV-03 to exploit the rule evaluation timing window.
+			_, _ = fmt.Fprintln(GinkgoWriter, "  Waiting for HighCPU alert to fire...")
+			Expect(kinfra.WaitForPrometheusRuleState(ctx, promURL, "HighCPU", kinfra.RuleStateFiring, 120*time.Second)).
+				To(Succeed(), "HighCPU alert must reach firing state within 120s")
+		}
+
+		_, _ = fmt.Fprintln(GinkgoWriter, "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+		_, _ = fmt.Fprintln(GinkgoWriter, "E2E Infrastructure Ready")
+		_, _ = fmt.Fprintln(GinkgoWriter, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+		setupSucceeded = true
+		return []byte(kubeconfigPath)
+	},
+	func(data []byte) {
+		kubeconfigPath = string(data)
+		baseURL = "https://localhost:18443"
+		caCertPath = filepath.Join(os.TempDir(), "apifrontend-e2e-certs", "ca.crt")
+		dexURL = "https://localhost:5556/dex"
+		clientID = "kubernaut-apifrontend"
+		clientSecret = "e2e-client-secret"
+		username = "e2e-user@kubernaut.ai"
+		password = "password"
+		httpClient = newTLSClient(caCertPath)
+
+		By("Building Kubernetes clients from kubeconfig")
+		restCfg, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+		Expect(err).NotTo(HaveOccurred(), "failed to build REST config from kubeconfig")
+
+		crScheme := k8sscheme.Scheme
+		Expect(remediationv1alpha1.AddToScheme(crScheme)).To(Succeed())
+		Expect(investigationsessionv1alpha1.AddToScheme(crScheme)).To(Succeed())
+
+		k8sClient, err = client.New(restCfg, client.Options{Scheme: crScheme})
+		Expect(err).NotTo(HaveOccurred(), "failed to create controller-runtime client")
+		clientset, err = kubernetes.NewForConfig(restCfg)
+		Expect(err).NotTo(HaveOccurred(), "failed to create kubernetes clientset")
+
+		// #2022/#2025/ADR-053: the mock-LLM's dedicated investigate fixture
+		// (af_investigate/af_progressive_investigate scenarios, see
+		// deploy/apifrontend/overlays/e2e/mock-llm.yaml) targets this
+		// namespace, which — unlike sev-tier1-ns et al. — was never actually
+		// created as a real Namespace object (only referenced as a string in
+		// RR specs and Prometheus alert labels). AF's scope check now
+		// fail-closes to unmanaged when neither the target resource nor its
+		// namespace exists/is labeled, so this namespace must exist and
+		// carry the managed label for kubernaut_investigate to proceed past
+		// scope validation, matching a real Kubernaut deployment's setup.
+		Expect(kinfra.EnsureManagedNamespace(context.Background(), k8sClient, "af-investigate-e2e")).
+			To(Succeed(), "af-investigate-e2e namespace must exist and be labeled managed")
+
+		// structured_decision_e2e_test.go's groundSession helper uses its own
+		// dedicated namespace/target (StructuredDecisionGrounding alert,
+		// apifrontend_prometheus_e2e.go) rather than reusing af-investigate-e2e
+		// above, to avoid fixture contention with concurrent specs under
+		// Ginkgo --procs>1 (CI run 31320575553, E2E-AF-1395-001).
+		Expect(kinfra.EnsureManagedNamespace(context.Background(), k8sClient, "af-structured-decision-e2e")).
+			To(Succeed(), "af-structured-decision-e2e namespace must exist and be labeled managed")
+		helpers.EnsureTestPods(context.Background(), k8sClient, "af-structured-decision-e2e",
+			"structured-decision-target", "structured-decision-target-2",
+			"structured-decision-target-3", "structured-decision-target-4")
+
+		healthURL := "http://localhost:18081"
+		Eventually(func() error {
+			resp, err := http.Get(healthURL + "/healthz") //nolint:gosec,noctx // E2E health probe
+			if err != nil {
+				return err
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				return fmt.Errorf("healthz returned %d", resp.StatusCode)
+			}
+			return nil
+		}, 60*time.Second, 2*time.Second).Should(Succeed(), "AF should become healthy on HTTP")
+
+		Eventually(func() error {
+			resp, err := httpClient.Get(baseURL + "/healthz")
+			if err != nil {
+				return fmt.Errorf("TLS healthz failed: %w", err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				return fmt.Errorf("TLS healthz returned %d", resp.StatusCode)
+			}
+			return nil
+		}, 30*time.Second, 2*time.Second).Should(Succeed(), "AF should be reachable over TLS (https://localhost:18443)")
+	},
+)
+
+var _ = SynchronizedAfterSuite(
+	func() {},
+	func() {
+		_, _ = fmt.Fprintln(GinkgoWriter, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+		_, _ = fmt.Fprintln(GinkgoWriter, "AF E2E Test Suite - Teardown")
+		_, _ = fmt.Fprintln(GinkgoWriter, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+		setupFailed := !setupSucceeded
+		anyFailure := kinfra.ResolveAnyFailure(e2eClusterName, setupFailed, anyTestFailed, GinkgoWriter)
+		defer kinfra.CleanupFailureMarker(e2eClusterName)
+
+		if anyFailure {
+			_, _ = fmt.Fprintln(GinkgoWriter, "⚠️  Failure detected — collecting must-gather diagnostics BEFORE teardown")
+			// DD-TESTING-003: production must-gather image as a local podman
+			// container on the cluster's "kind" network (see gateway suite
+			// pilot), replacing the old in-process kubectl-log-scraping.
+			mustGatherImage, buildErr := kinfra.BuildMustGatherImageForE2E(context.Background(), GinkgoWriter)
+			if buildErr != nil {
+				_, _ = fmt.Fprintf(GinkgoWriter, "WARNING: Failed to build must-gather image (non-fatal): %v\n", buildErr)
+			} else {
+				mustGatherOutputDir := filepath.Join("/tmp", "kubernaut-must-gather", "apifrontend", e2eClusterName)
+				if err := kinfra.RunMustGatherImage(context.Background(), kinfra.RunMustGatherImageOptions{
+					ClusterName: e2eClusterName,
+					Image:       mustGatherImage,
+					OutputDir:   mustGatherOutputDir,
+					Namespace:   e2eNamespace,
+					UsePodman:   true,
+				}, GinkgoWriter); err != nil {
+					_, _ = fmt.Fprintf(GinkgoWriter, "WARNING: Failed to run must-gather image (non-fatal): %v\n", err)
+				}
+			}
+		}
+
+		_, _ = fmt.Fprintln(GinkgoWriter, "\nCollecting E2E binary coverage data (DD-TEST-007)...")
+		if err := kinfra.CollectAFE2EBinaryCoverage(e2eClusterName, GinkgoWriter); err != nil {
+			_, _ = fmt.Fprintf(GinkgoWriter, "WARNING: Coverage collection failed (non-fatal): %v\n", err)
+		}
+
+		if os.Getenv("AF_E2E_SKIP_TEARDOWN") == trueFixture {
+			_, _ = fmt.Fprintln(GinkgoWriter, "Skipping teardown (AF_E2E_SKIP_TEARDOWN=true)")
+			return
+		}
+		if os.Getenv("AF_E2E_SKIP_INFRA") == trueFixture {
+			return
+		}
+
+		if err := kinfra.DeleteCluster(e2eClusterName, "apifrontend", anyFailure, GinkgoWriter); err != nil {
+			_, _ = fmt.Fprintf(GinkgoWriter, "WARNING: Cluster deletion failed: %v\n", err)
+		}
+	},
+)

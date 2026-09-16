@@ -1,0 +1,500 @@
+/*
+Copyright 2026 Jordi Gil.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package custom
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/go-logr/logr"
+	"github.com/google/uuid"
+
+	kaaudit "github.com/jordigilh/kubernaut/internal/kubernautagent/audit"
+	"github.com/jordigilh/kubernaut/internal/kubernautagent/enrichment"
+	"github.com/jordigilh/kubernaut/pkg/datastorage/models"
+	katypes "github.com/jordigilh/kubernaut/pkg/kubernautagent/types"
+	"github.com/jordigilh/kubernaut/pkg/kubernautagent/tools"
+	"github.com/jordigilh/kubernaut/pkg/kubernautagent/tools/registry"
+)
+
+var listAvailableActionsSchema = json.RawMessage(`{
+	"type": "object",
+	"properties": {
+		"page": {"type": "string", "enum": ["next", "previous"], "description": "Navigation direction. Omit on first call."},
+		"cursor": {"type": "string", "description": "Opaque cursor from previous response. Required when page is set."}
+	},
+	"additionalProperties": false
+}`)
+
+var listWorkflowsSchemaJSON = json.RawMessage(`{
+	"type": "object",
+	"properties": {
+		"action_type": {"type": "string", "description": "The action type to filter workflows by"},
+		"page": {"type": "string", "enum": ["next", "previous"], "description": "Navigation direction. Omit on first call."},
+		"cursor": {"type": "string", "description": "Opaque cursor from previous response. Required when page is set."}
+	},
+	"required": ["action_type"]
+}`)
+
+var getWorkflowSchemaJSON = json.RawMessage(`{
+	"type": "object",
+	"properties": {
+		"workflow_id": {"type": "string", "description": "UUID of the workflow to retrieve"}
+	},
+	"required": ["workflow_id"]
+}`)
+
+// WorkflowCatalog is the subset of workflowcatalog.Catalog's three-step
+// discovery protocol used by the custom MCP tools below. Satisfied by
+// *workflowcatalog.Catalog in production; defined here (rather than
+// importing the workflowcatalog package) so unit tests can substitute a
+// lightweight fake without standing up an informer cache/envtest.
+//
+// Issue #1677 Phase 2d (DD-WORKFLOW-019): replaces the former
+// WorkflowDiscoveryClient/*ogenclient.Client indirection through
+// DataStorage -- KA now queries its own cache-backed Catalog directly.
+type WorkflowCatalog interface {
+	ListActions(ctx context.Context, filters *models.WorkflowDiscoveryFilters, offset, limit int) ([]models.ActionTypeEntry, int, error)
+	ListWorkflowsByActionType(ctx context.Context, actionType string, filters *models.WorkflowDiscoveryFilters, offset, limit int) ([]models.RemediationWorkflow, int, error)
+	GetWorkflowWithContextFilters(ctx context.Context, workflowID string, filters *models.WorkflowDiscoveryFilters) (*models.RemediationWorkflow, error)
+}
+
+// AllToolNames lists the 5 custom tool names for DataStorage interaction and resource context.
+var AllToolNames = []string{
+	"list_available_actions",
+	"list_workflows",
+	"get_workflow",
+	"get_namespaced_resource_context",
+	"get_cluster_resource_context",
+}
+
+// NewAllTools creates the 3 workflow discovery tools using any WorkflowCatalog.
+// Pass *workflowcatalog.Catalog in production or a fake in tests. auditStore may be
+// nil (audit emission becomes a no-op, matching kaaudit.StoreBestEffort callers elsewhere).
+func NewAllTools(catalog WorkflowCatalog, auditStore kaaudit.AuditStore, logger logr.Logger) []tools.Tool {
+	return []tools.Tool{
+		&listActionsTool{catalog: catalog, auditStore: auditStore, logger: logger},
+		&listWorkflowsTool{catalog: catalog, auditStore: auditStore, logger: logger},
+		&getWorkflowTool{catalog: catalog, auditStore: auditStore, logger: logger},
+	}
+}
+
+// RegisterAll registers all 5 custom tools (3 workflow discovery tools + 2 resource context
+// tools) into the given registry. Pass nil for any dependency to create tools that will fail
+// at execution time rather than registration time.
+func RegisterAll(reg *registry.Registry, catalog WorkflowCatalog, auditStore kaaudit.AuditStore, dsClient enrichment.DataStorageClient, k8sClient enrichment.K8sClient, logger logr.Logger) {
+	for _, t := range NewAllTools(catalog, auditStore, logger) {
+		reg.Register(t)
+	}
+	reg.Register(NewNamespacedResourceContextTool(dsClient, k8sClient, logger))
+	reg.Register(NewClusterResourceContextTool(dsClient, k8sClient, logger))
+}
+
+// signalFromContext extracts the SignalContext from ctx. Workflow discovery
+// tools require this to filter the catalog by the active incident's
+// severity, component, environment, and priority (#779).
+func signalFromContext(ctx context.Context, toolName string) (katypes.SignalContext, error) {
+	signal, ok := katypes.SignalContextFromContext(ctx)
+	if !ok {
+		return katypes.SignalContext{}, fmt.Errorf("%s: signal context required but not found in context", toolName)
+	}
+	return signal, nil
+}
+
+// componentFromSignal resolves the discovery Component filter: the GVK
+// (apiVersion/Kind) form when available, falling back to the lowercased
+// bare resource kind (#1051, #1439).
+func componentFromSignal(signal katypes.SignalContext) string {
+	component := signal.ComponentGVK()
+	if component == "" {
+		component = strings.ToLower(signal.ResourceKind)
+	}
+	return component
+}
+
+// filtersFromSignal builds the discovery-protocol context filters forwarded
+// on every list_available_actions/list_workflows call (BR-WORKFLOW-016,
+// #779, #1052, #1511). Unlike get_workflow's best-effort forwarding, these
+// two tools always have a required signal context (signalFromContext).
+func filtersFromSignal(signal katypes.SignalContext) *models.WorkflowDiscoveryFilters {
+	filters := &models.WorkflowDiscoveryFilters{
+		Severity:      signal.Severity,
+		Component:     componentFromSignal(signal),
+		Environment:   signal.Environment,
+		Priority:      signal.Priority,
+		RemediationID: signal.RemediationID,
+		Cluster:       signal.ClusterClassification,
+	}
+	if signal.DetectedLabelsJSON != "" {
+		var dl models.DetectedLabels
+		if err := json.Unmarshal([]byte(signal.DetectedLabelsJSON), &dl); err == nil {
+			filters.DetectedLabels = &dl
+		}
+	}
+	return filters
+}
+
+// --- list_available_actions ---
+
+type listActionsTool struct {
+	catalog    WorkflowCatalog
+	auditStore kaaudit.AuditStore
+	logger     logr.Logger
+}
+
+func (t *listActionsTool) Name() string { return "list_available_actions" }
+func (t *listActionsTool) Description() string {
+	return "List available remediation action types from the workflow catalog"
+}
+func (t *listActionsTool) Parameters() json.RawMessage { return listAvailableActionsSchema }
+
+func (t *listActionsTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+	signal, err := signalFromContext(ctx, "listing action types")
+	if err != nil {
+		return "", err
+	}
+
+	var a struct {
+		Page   string `json:"page"`
+		Cursor string `json:"cursor"`
+	}
+	if err := json.Unmarshal(args, &a); err != nil {
+		return "", fmt.Errorf("parsing args: %w", err)
+	}
+
+	filters := filtersFromSignal(signal)
+	logr.FromContextOrDiscard(ctx).V(1).Info("list_available_actions: resolved component",
+		"component", filters.Component, "remediation_id", signal.RemediationID)
+
+	offset, limit := 0, defaultPaginationLimit
+	if a.Page != "" && a.Cursor != "" {
+		offset, limit = decodeCursor(a.Cursor)
+	}
+
+	if t.catalog == nil {
+		return "", fmt.Errorf("listing action types: workflow catalog unavailable")
+	}
+
+	start := time.Now()
+	entries, totalCount, err := t.catalog.ListActions(ctx, filters, offset, limit)
+	durationMs := time.Since(start).Milliseconds()
+	if err != nil {
+		return "", fmt.Errorf("listing action types: %w", err)
+	}
+
+	t.emitAuditEvent(ctx, filters, totalCount, durationMs)
+
+	resp := models.ActionTypeListResponse{
+		ActionTypes: entries,
+		Pagination: models.PaginationMetadata{
+			TotalCount: totalCount,
+			Offset:     offset,
+			Limit:      limit,
+			HasMore:    offset+limit < totalCount,
+		},
+	}
+	data, err := json.Marshal(resp)
+	if err != nil {
+		return "", fmt.Errorf("marshaling action types response: %w", err)
+	}
+	return string(transformPagination(data)), nil
+}
+
+// --- list_workflows ---
+
+type listWorkflowsTool struct {
+	catalog    WorkflowCatalog
+	auditStore kaaudit.AuditStore
+	logger     logr.Logger
+}
+
+func (t *listWorkflowsTool) Name() string { return "list_workflows" }
+func (t *listWorkflowsTool) Description() string {
+	return "Search for workflows by action type in the workflow catalog"
+}
+func (t *listWorkflowsTool) Parameters() json.RawMessage { return listWorkflowsSchemaJSON }
+
+func (t *listWorkflowsTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+	signal, err := signalFromContext(ctx, "listing workflows")
+	if err != nil {
+		return "", err
+	}
+
+	var a struct {
+		ActionType string `json:"action_type"`
+		Page       string `json:"page"`
+		Cursor     string `json:"cursor"`
+	}
+	if err := json.Unmarshal(args, &a); err != nil {
+		return "", fmt.Errorf("parsing args: %w", err)
+	}
+
+	filters := filtersFromSignal(signal)
+	logr.FromContextOrDiscard(ctx).V(1).Info("list_workflows: resolved component",
+		"component", filters.Component, "remediation_id", signal.RemediationID)
+
+	offset, limit := 0, defaultPaginationLimit
+	if a.Page != "" && a.Cursor != "" {
+		offset, limit = decodeCursor(a.Cursor)
+	}
+
+	if t.catalog == nil {
+		return "", fmt.Errorf("listing workflows: workflow catalog unavailable")
+	}
+
+	start := time.Now()
+	workflows, totalCount, err := t.catalog.ListWorkflowsByActionType(ctx, a.ActionType, filters, offset, limit)
+	durationMs := time.Since(start).Milliseconds()
+	if err != nil {
+		return "", fmt.Errorf("listing workflows: %w", err)
+	}
+
+	t.emitAuditEvent(ctx, a.ActionType, filters, totalCount, durationMs)
+
+	resp := models.WorkflowDiscoveryResponse{
+		ActionType: a.ActionType,
+		Workflows:  convertWorkflowsToDiscoveryEntries(workflows),
+		Pagination: models.PaginationMetadata{
+			TotalCount: totalCount,
+			Offset:     offset,
+			Limit:      limit,
+			HasMore:    offset+limit < totalCount,
+		},
+	}
+	data, err := json.Marshal(resp)
+	if err != nil {
+		return "", fmt.Errorf("marshaling workflows response: %w", err)
+	}
+	return string(transformPagination(data)), nil
+}
+
+// convertWorkflowsToDiscoveryEntries converts catalog workflow records into
+// the LLM-facing discovery entry shape. DD-KA-017 v1.1: ActualSuccessRate
+// and TotalExecutions are intentionally excluded -- global aggregate metrics
+// are misleading for per-incident workflow selection. Ported verbatim from
+// pkg/datastorage/server/workflow_discovery_handlers.go (Issue #1677 Phase 2d).
+func convertWorkflowsToDiscoveryEntries(workflows []models.RemediationWorkflow) []models.WorkflowDiscoveryEntry {
+	discoveryEntries := make([]models.WorkflowDiscoveryEntry, 0, len(workflows))
+	for _, wf := range workflows {
+		entry := models.WorkflowDiscoveryEntry{
+			WorkflowID:      wf.WorkflowID,
+			WorkflowName:    wf.WorkflowName,
+			Name:            wf.Name,
+			Description:     wf.Description,
+			Version:         wf.Version,
+			ExecutionEngine: string(wf.ExecutionEngine),
+		}
+		if wf.SchemaImage != nil {
+			entry.SchemaImage = *wf.SchemaImage
+		}
+		if wf.ExecutionBundle != nil {
+			entry.ExecutionBundle = *wf.ExecutionBundle
+		}
+		if wf.ServiceAccountName != nil {
+			entry.ServiceAccountName = *wf.ServiceAccountName
+		}
+		discoveryEntries = append(discoveryEntries, entry)
+	}
+	return discoveryEntries
+}
+
+// --- get_workflow ---
+
+type getWorkflowTool struct {
+	catalog    WorkflowCatalog
+	auditStore kaaudit.AuditStore
+	logger     logr.Logger
+}
+
+func (t *getWorkflowTool) Name() string                { return "get_workflow" }
+func (t *getWorkflowTool) Description() string         { return "Get a specific workflow definition by ID" }
+func (t *getWorkflowTool) Parameters() json.RawMessage { return getWorkflowSchemaJSON }
+
+func (t *getWorkflowTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+	var a struct {
+		WorkflowID string `json:"workflow_id"`
+	}
+	if err := json.Unmarshal(args, &a); err != nil {
+		return "", fmt.Errorf("parsing args: %w", err)
+	}
+
+	if _, err := uuid.Parse(a.WorkflowID); err != nil {
+		return "", fmt.Errorf("invalid workflow ID %q: %w", a.WorkflowID, err)
+	}
+
+	// Best-effort: forward signal context for audit correlation and security-gate
+	// filtering. Non-investigator callers (e.g., notification resolver) may not
+	// have a signal context — that is acceptable (#1111).
+	var filters *models.WorkflowDiscoveryFilters
+	signal, ok := katypes.SignalContextFromContext(ctx)
+	if ok && signal.RemediationID != "" {
+		filters = &models.WorkflowDiscoveryFilters{
+			Severity:      signal.Severity,
+			Component:     componentFromSignal(signal),
+			Environment:   signal.Environment,
+			Priority:      signal.Priority,
+			RemediationID: signal.RemediationID,
+		}
+	}
+
+	if t.catalog == nil {
+		return "", fmt.Errorf("getting workflow: workflow catalog unavailable")
+	}
+
+	start := time.Now()
+	wf, err := t.catalog.GetWorkflowWithContextFilters(ctx, a.WorkflowID, filters)
+	durationMs := time.Since(start).Milliseconds()
+	if err != nil {
+		return "", fmt.Errorf("getting workflow: %w", err)
+	}
+
+	t.emitAuditEvents(ctx, a.WorkflowID, filters, durationMs)
+
+	// DD-WORKFLOW-018/Issue #1677 Phase 2d (user-confirmed): the on-demand
+	// success-metrics overlay (TotalExecutions/SuccessfulExecutions/
+	// ActualSuccessRate) is dropped entirely rather than migrated -- it was
+	// best-effort display telemetry from an abandoned success-rate-weighted
+	// selection design with zero use in the actual scoring logic.
+	data, err := json.Marshal(wf)
+	if err != nil {
+		return "", fmt.Errorf("marshaling workflow response: %w", err)
+	}
+	return string(data), nil
+}
+
+// stripPaginationIfComplete (superseded by transformPagination, DD-WORKFLOW-016
+// v1.4) was removed as dead code (#1677 dead-code sweep, follow-up):
+// transformPagination is a strict superset -- it strips pagination under the
+// same "no more pages" condition plus the offset>0 edge case this function
+// didn't handle, and additionally converts raw offset/limit/totalCount into
+// LLM-safe cursors instead of exposing them directly.
+
+const defaultPaginationLimit = 10
+const maxPaginationLimit = 100
+
+type cursorPayload struct {
+	Offset int `json:"o"`
+	Limit  int `json:"l"`
+}
+
+// EncodeCursor encodes offset and limit into an opaque base64-URL cursor token.
+// DD-WORKFLOW-016 v1.4: cursors hide pagination implementation from the LLM.
+func EncodeCursor(offset, limit int) string {
+	b, err := json.Marshal(cursorPayload{Offset: offset, Limit: limit})
+	if err != nil {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// decodeCursor decodes an opaque cursor token into offset and limit.
+// Returns safe defaults (0, 10) on any failure (invalid base64, non-JSON, tampered values).
+// Mirrors the discovery protocol's pagination clamping for defense-in-depth.
+func decodeCursor(token string) (offset int, limit int) {
+	if token == "" {
+		return 0, defaultPaginationLimit
+	}
+
+	raw, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil {
+		return 0, defaultPaginationLimit
+	}
+
+	var p cursorPayload
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return 0, defaultPaginationLimit
+	}
+
+	if p.Offset < 0 {
+		p.Offset = 0
+	}
+	if p.Limit <= 0 {
+		p.Limit = defaultPaginationLimit
+	}
+	if p.Limit > maxPaginationLimit {
+		p.Limit = maxPaginationLimit
+	}
+
+	return p.Offset, p.Limit
+}
+
+// transformPagination converts PaginationMetadata (totalCount, offset, limit, hasMore)
+// into LLM-facing cursor-based pagination (hasNext, nextCursor, hasPrevious, previousCursor).
+// Single-page results (offset=0, hasMore=false) have pagination stripped entirely.
+// DD-WORKFLOW-016 v1.4: totalCount is never exposed to the LLM.
+func transformPagination(data json.RawMessage) json.RawMessage {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(data, &obj); err != nil {
+		return data
+	}
+
+	paginationRaw, ok := obj["pagination"]
+	if !ok {
+		return data
+	}
+
+	var dsPag struct {
+		TotalCount int  `json:"totalCount"`
+		Offset     int  `json:"offset"`
+		Limit      int  `json:"limit"`
+		HasMore    bool `json:"hasMore"`
+	}
+	if err := json.Unmarshal(paginationRaw, &dsPag); err != nil {
+		return data
+	}
+
+	if dsPag.Offset == 0 && !dsPag.HasMore {
+		delete(obj, "pagination")
+		result, err := json.Marshal(obj)
+		if err != nil {
+			return data
+		}
+		return result
+	}
+
+	llmPag := make(map[string]interface{})
+
+	if dsPag.HasMore {
+		llmPag["hasNext"] = true
+		llmPag["nextCursor"] = EncodeCursor(dsPag.Offset+dsPag.Limit, dsPag.Limit)
+	}
+
+	if dsPag.Offset > 0 {
+		prevOffset := dsPag.Offset - dsPag.Limit
+		if prevOffset < 0 {
+			prevOffset = 0
+		}
+		llmPag["hasPrevious"] = true
+		llmPag["previousCursor"] = EncodeCursor(prevOffset, dsPag.Limit)
+	}
+
+	transformed, err := json.Marshal(llmPag)
+	if err != nil {
+		return data
+	}
+	obj["pagination"] = transformed
+
+	result, err := json.Marshal(obj)
+	if err != nil {
+		return data
+	}
+	return result
+}

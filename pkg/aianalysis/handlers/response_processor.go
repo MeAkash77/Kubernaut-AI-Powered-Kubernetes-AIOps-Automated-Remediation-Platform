@@ -1,0 +1,1035 @@
+/*
+Copyright 2025 Jordi Gil.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+// Package handlers implements phase handlers for the AIAnalysis controller.
+// This file contains response processing logic extracted from investigating.go.
+//
+// Refactoring: P1.1 - Extract ResponseProcessor (Dec 20, 2025)
+// DD-AA-KA-001, BR-AA-KA-065.2: rewritten to consume agentsessionv1.AgentSessionResult
+// (the AgentSession.Status.Result field KA writes) directly, replacing the
+// retired agentclient.IncidentResponse ogen type. The business classification
+// logic below (confidence threshold, needs_human_review precedence, problem-
+// resolved/not-actionable/no-workflow outcome routing) is UNCHANGED -- only
+// the input type and field access (plain Go fields instead of ogen opt.*
+// wrappers) differ.
+package handlers
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/go-logr/logr"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
+
+	agentsessionv1 "github.com/jordigilh/kubernaut/api/agentsession/v1alpha1"
+	aianalysisv1 "github.com/jordigilh/kubernaut/api/aianalysis/v1alpha1"
+	"github.com/jordigilh/kubernaut/pkg/aianalysis"
+	"github.com/jordigilh/kubernaut/pkg/aianalysis/metrics"
+	sharedtypes "github.com/jordigilh/kubernaut/pkg/shared/types"
+)
+
+// defaultLowConfidenceFloor is the V1.0 global default applied when no
+// operator override is configured (BR-KA-197 AC-4, BR-AI-088.4).
+const defaultLowConfidenceFloor = 0.7
+
+// ResponseProcessor handles processing of KA responses
+// BR-AI-008: Capture all response fields including RCA, workflow, and alternatives
+// BR-KA-197: Check needs_human_review before proceeding
+// BR-KA-200: Handle problem_resolved outcomes
+type ResponseProcessor struct {
+	log                logr.Logger
+	metrics            *metrics.Metrics
+	auditClient        AuditClientInterface
+	lowConfidenceFloor *float64 // BR-AI-088.4, Issue #1828: operator-configurable override of defaultLowConfidenceFloor
+}
+
+// NewResponseProcessor creates a new ResponseProcessor
+func NewResponseProcessor(log logr.Logger, m *metrics.Metrics, auditClient AuditClientInterface) *ResponseProcessor {
+	if m == nil {
+		panic("metrics cannot be nil: metrics are mandatory for observability")
+	}
+	return &ResponseProcessor{
+		log:         log.WithName("response-processor"),
+		metrics:     m,
+		auditClient: auditClient,
+	}
+}
+
+// WithLowConfidenceFloor sets the operator-configurable floor for
+// auto-proceeding with a KA-selected workflow (BR-AI-088.4, Issue #1828).
+// nil means "use defaultLowConfidenceFloor" (V1.0 70% global default).
+// Mirrors AnalyzingHandler.WithConfidenceThreshold's chainable-setter shape
+// (analyzing.go) for the sibling, later Rego auto-approval gate (#225) —
+// these are two distinct gates; see the field's doc comment.
+func (p *ResponseProcessor) WithLowConfidenceFloor(floor *float64) *ResponseProcessor {
+	p.lowConfidenceFloor = floor
+	return p
+}
+
+// effectiveLowConfidenceFloor returns the operator-configured floor, or
+// defaultLowConfidenceFloor when unset.
+func (p *ResponseProcessor) effectiveLowConfidenceFloor() float64 {
+	if p.lowConfidenceFloor != nil {
+		return *p.lowConfidenceFloor
+	}
+	return defaultLowConfidenceFloor
+}
+
+// mapFromAgentSessionJSON decodes an AgentSessionResult raw-JSON field
+// (RootCauseAnalysis, SelectedWorkflow, DetectedLabels) into a generic map so
+// the existing GetStringFromMap/GetFloat64FromMap/etc. extraction helpers
+// keep working unchanged regardless of source (same precedent as the retired
+// ogen additionalProperties maps).
+func mapFromAgentSessionJSON(j *apiextensionsv1.JSON) map[string]interface{} {
+	if j == nil || len(j.Raw) == 0 {
+		return nil
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(j.Raw, &m); err != nil {
+		return nil
+	}
+	return m
+}
+
+// ProcessAgentSessionResult processes the curated AgentSessionResult KA wrote
+// to AgentSession.Status.Result on the Completed transition.
+// BR-AI-009: Reset failure counter on successful API call
+// BR-KA-197: Check needs_human_review before proceeding
+func (p *ResponseProcessor) ProcessAgentSessionResult(ctx context.Context, analysis *aianalysisv1.AIAnalysis, res *agentsessionv1.AgentSessionResult) (ctrl.Result, error) {
+	// BR-AI-009: Reset failure counter on successful API call
+	analysis.Status.EnsureInvestigationMetadata().ConsecutiveFailures = 0
+
+	// #388: All processed alerts are actionable by default; only the
+	// NotActionable handler overrides this to "NotActionable".
+	analysis.Status.EnsureRCAResult().Actionability = aianalysis.ActionabilityActionable
+
+	// BR-AI-601: Map alignment verdict from KA to CRD status for ALL response paths.
+	p.mapAlignmentVerdict(analysis, res)
+
+	// ADR-056: Persist detected labels before routing any response outcome so
+	// terminal paths retain the same post-RCA context as normal success.
+	p.populatePostRCAContext(analysis, res.DetectedLabels)
+
+	// Check if NeedsHumanReview is set
+	needsHumanReview := res.NeedsHumanReview
+	hasSelectedWorkflow := res.SelectedWorkflow != nil
+
+	p.log.Info("Processing successful incident response",
+		"confidence", res.Confidence,
+		"warningsCount", len(res.Warnings),
+		"hasSelectedWorkflow", hasSelectedWorkflow,
+		"needsHumanReview", needsHumanReview,
+	)
+
+	// BR-AI-OBSERVABILITY-004: Record confidence score for AI quality tracking
+	p.metrics.RecordConfidenceScore(analysis.Spec.AnalysisRequest.SignalContext.SignalName, res.Confidence)
+
+	// BR-KA-197: Check if KA explicitly requires human review (Layer 1 - Primary)
+	// CRITICAL: This MUST be checked FIRST. KA's explicit needs_human_review=true
+	// takes priority over all other classification logic.
+	if needsHumanReview {
+		return p.handleWorkflowResolutionFailureFromIncident(ctx, analysis, res)
+	}
+
+	if result, err, handled := p.checkAlternateOutcomes(ctx, analysis, res, hasSelectedWorkflow); handled {
+		return result, err
+	}
+
+	// BR-KA-197 AC-4 + Issue #28: AIAnalysis applies confidence threshold (V1.0: 70% default)
+	// KA returns confidence but does NOT enforce thresholds - AIAnalysis owns this logic
+	// BR-AI-088.4 / Issue #1828: operator-configurable via WithLowConfidenceFloor
+	confidenceThreshold := p.effectiveLowConfidenceFloor()
+
+	if hasSelectedWorkflow && res.Confidence < confidenceThreshold {
+		return p.handleLowConfidenceFailure(ctx, analysis, res)
+	}
+
+	return p.finalizeSuccessfulInvestigation(analysis, res, hasSelectedWorkflow)
+}
+
+// checkAlternateOutcomes evaluates the BR-KA-200.6 Outcome A (problem
+// resolved), #388/#607 Outcome D (not actionable), and BR-AI-050/#29
+// (no-workflow terminal failure) branches of ProcessAgentSessionResult, in
+// that precedence order. The returned bool reports whether one of these
+// outcomes matched and the caller should return (result, err) immediately;
+// handled=false means the caller should continue to the confidence-threshold
+// and success paths.
+func (p *ResponseProcessor) checkAlternateOutcomes(ctx context.Context, analysis *aianalysisv1.AIAnalysis, res *agentsessionv1.AgentSessionResult, hasSelectedWorkflow bool) (ctrl.Result, error, bool) {
+	// BR-KA-200.6 Outcome A: Problem confidently resolved, no workflow needed
+	// Detection per BR-KA-200.6: needs_human_review=false AND selected_workflow=null AND confidence >= 0.7
+	// Defense-in-depth (Layer 2): also verify no warning signals that indicate an active
+	// problem (inconclusive investigation, no matching workflows). This catches edge cases
+	// where the LLM incorrectly overrides needs_human_review=false but KA still appends
+	// diagnostic warnings from its investigation_outcome parsing.
+	// #208 (Layer 3): If the LLM provided a substantive RCA (with contributing factors),
+	// it identified a real problem. Route to human review since no workflow was selected,
+	// rather than silently closing as "no action required."
+	// #301: When KA's "Problem self-resolved" signal is present (from investigation_outcome=resolved),
+	// bypass the hasSubstantiveRCA check — the RCA documents the transient condition for audit,
+	// not an ongoing problem requiring intervention.
+	// #607: When agent explicitly says "not actionable", Outcome D must win over Outcome A.
+	// This matches Python KA's precedence where actionable=false is evaluated first.
+	isResolved := hasProblemResolvedSignal(res.Warnings)
+	if !hasSelectedWorkflow && res.Confidence >= 0.7 && !hasNoWorkflowWarningSignal(res.Warnings) && !hasNotActionableSignal(res.Warnings) && (isResolved || !hasSubstantiveRCA(res.RootCauseAnalysis)) {
+		result, err := p.handleProblemResolvedFromIncident(ctx, analysis, res)
+		return result, err, true
+	}
+
+	// #388 + #607 Outcome D: Alert not actionable — benign condition, no remediation warranted.
+	// When the agent signals actionable=false (via warning + is_actionable field), this is an
+	// authoritative LLM determination — same trust pattern as needs_human_review (line 94).
+	// #607: Removed confidence >= 0.7 gate. The LLM's explicit actionable=false is trusted
+	// regardless of confidence. The agent applies a confidence floor of 0.8 as defense-in-depth.
+	isNotActionable := hasNotActionableSignal(res.Warnings)
+	isActionablePtr := res.IsActionable
+	if !hasSelectedWorkflow && isNotActionable && isActionablePtr != nil && !*isActionablePtr {
+		result, err := p.handleNotActionableFromIncident(ctx, analysis, res)
+		return result, err, true
+	}
+
+	// BR-AI-050 + Issue #29: No workflow found (terminal failure requiring human review)
+	// Reached when: (a) confidence < 0.7 with no workflow, OR
+	// (b) confidence >= 0.7 but warning signals indicate an active problem (defense-in-depth)
+	if !hasSelectedWorkflow {
+		result, err := p.handleNoWorkflowTerminalFailure(ctx, analysis, res)
+		return result, err, true
+	}
+
+	return ctrl.Result{}, nil, false
+}
+
+// finalizeSuccessfulInvestigation stores the KA response metadata (warnings,
+// investigation ID, PostRCAContext, RCA, selected/alternative workflows) and
+// transitions analysis to the Analyzing phase. Reached only when KA did not
+// require human review and either selected a workflow above the confidence
+// threshold or requires no workflow.
+func (p *ResponseProcessor) finalizeSuccessfulInvestigation(analysis *aianalysisv1.AIAnalysis, res *agentsessionv1.AgentSessionResult, hasSelectedWorkflow bool) (ctrl.Result, error) {
+	im := analysis.Status.EnsureInvestigationMetadata()
+	im.Warnings = res.Warnings
+	im.InvestigationID = res.IncidentID
+
+	// ADR-055: TargetInOwnerChain removed. remediationTarget is now a first-class
+	// LLM RCA output, not derived from pre-computed owner chain.
+
+	// Store root cause analysis (if present) - uses centralized helper with remediationTarget
+	if rca := ExtractRootCauseAnalysis(res.RootCauseAnalysis); rca != nil {
+		rcaResult := analysis.Status.EnsureRCAResult()
+		rcaResult.RootCause = rca.Summary
+		rcaResult.RootCauseAnalysis = rca
+	}
+
+	// Store selected workflow (DD-CONTRACT-002)
+	if hasSelectedWorkflow {
+		storeSelectedWorkflow(analysis, res)
+	}
+
+	// Store alternative workflows (INFORMATIONAL ONLY - NOT for execution)
+	storeAlternativeWorkflows(analysis, res)
+
+	// BR-KA-197: No human review needed for successful workflow selection
+	analysis.Status.EnsureReview().NeedsHumanReview = false
+
+	// Set InvestigationComplete condition
+	aianalysis.SetInvestigationComplete(analysis, true, "KA investigation completed successfully")
+
+	// Transition to Analyzing phase
+	// Note: ObservedGeneration set by InvestigatingHandler before returning
+	analysis.Status.Phase = aianalysis.PhaseAnalyzing
+	analysis.Status.Message = "Investigation complete, starting analysis"
+
+	// DD-AUDIT-003: Phase transition audit recorded by InvestigatingHandler (investigating.go)
+	// NOT recorded here to avoid duplicates - handler records after status is committed
+
+	return ctrl.Result{Requeue: true}, nil
+}
+
+// storeSelectedWorkflow populates analysis.Status.SelectedWorkflow from the
+// KA response's selected_workflow map (DD-CONTRACT-002), including optional
+// parameters and BR-WE-016 raw engine_config pass-through. No-op if the map
+// can't be extracted.
+func storeSelectedWorkflow(analysis *aianalysisv1.AIAnalysis, res *agentsessionv1.AgentSessionResult) {
+	swMap := mapFromAgentSessionJSON(res.SelectedWorkflow)
+	if swMap == nil {
+		return
+	}
+	sw := &aianalysisv1.SelectedWorkflow{
+		WorkflowSnapshot: sharedtypes.WorkflowSnapshot{
+			WorkflowID:            GetStringFromMap(swMap, "workflow_id"),
+			WorkflowName:          GetStringFromMap(swMap, "workflow_name"),
+			ActionType:            GetStringFromMap(swMap, "action_type"),
+			Version:               GetStringFromMap(swMap, "version"),
+			ExecutionBundle:       GetStringFromMap(swMap, "execution_bundle"),
+			ExecutionBundleDigest: GetStringFromMap(swMap, "execution_bundle_digest"),
+			ExecutionEngine:       GetStringFromMap(swMap, "execution_engine"),
+			// #1661 DD-WE-005 v2.0 / RCA follow-up: the WFE Job executor now reads
+			// the execution ServiceAccount exclusively from this CRD-embedded
+			// snapshot (wfe.Spec.WorkflowRef.ServiceAccountName, no
+			// executor-config fallback) -- omitting it here silently downgraded
+			// every job-engine Pod to the namespace's "default" SA, which lacks
+			// the workflow's cross-namespace get/patch RBAC and fails the Job
+			// fast (BackoffLimitExceeded) despite the image pulling and starting
+			// fine.
+			ServiceAccountName: GetStringFromMap(swMap, "service_account_name"),
+			// Issue #2326 (DD-FLEET-008, BR-FLEET-004): workflow-declared
+			// execution cluster, catalog-authoritative like ActionType/
+			// WorkflowName above.
+			ExecutionClusterID: GetStringFromMap(swMap, "execution_cluster_id"),
+		},
+		Confidence: GetFloat64FromMap(swMap, "confidence"),
+		Rationale:  GetStringFromMap(swMap, "rationale"),
+	}
+	// Map parameters if present (map[string]string)
+	if paramsRaw, ok := swMap["parameters"]; ok {
+		if paramsMapIface, ok := paramsRaw.(map[string]interface{}); ok {
+			sw.Parameters = convertMapToStringMap(paramsMapIface)
+		}
+	}
+	// BR-WE-016: Extract engine_config as raw JSON for pass-through
+	if ecRaw, ok := swMap["engine_config"]; ok && ecRaw != nil {
+		if ecBytes, err := json.Marshal(ecRaw); err == nil {
+			sw.EngineConfig = &apiextensionsv1.JSON{Raw: ecBytes}
+		}
+	}
+	stampWorkflowSnapshot(sw, swMap)
+	analysis.Status.EnsureRCAResult().SelectedWorkflow = sw
+}
+
+// stampWorkflowSnapshot populates the CRD-embedded execution snapshot fields
+// (Issue #1661 Change 11b, DD-WORKFLOW-018) and stamps SelectedAt, arming the
+// SelectedWorkflow write-once CEL guard (mirrors PostRCAContext/ADR-056).
+// Shared by all three population call sites — storeSelectedWorkflow,
+// preservePartialSelectedWorkflow, preserveLowConfidenceWorkflow — so every
+// terminal path that persists a SelectedWorkflow locks it the same way.
+func stampWorkflowSnapshot(sw *aianalysisv1.SelectedWorkflow, swMap map[string]interface{}) {
+	sw.Dependencies = extractWorkflowDependencies(swMap)
+	sw.Resources = extractResourceRequirements(swMap)
+	sw.DeclaredParameterNames = extractDeclaredParameterNames(swMap)
+	now := metav1.Now()
+	sw.SelectedAt = &now
+}
+
+// storeAlternativeWorkflows populates analysis.Status.AlternativeWorkflows
+// from the KA response (informational only — not for execution). No-op if
+// the response has none.
+func storeAlternativeWorkflows(analysis *aianalysisv1.AIAnalysis, res *agentsessionv1.AgentSessionResult) {
+	if len(res.AlternativeWorkflows) == 0 {
+		return
+	}
+	alternatives := make([]aianalysisv1.AlternativeWorkflow, 0, len(res.AlternativeWorkflows))
+	for _, alt := range res.AlternativeWorkflows {
+		alternatives = append(alternatives, aianalysisv1.AlternativeWorkflow{
+			WorkflowID:      alt.WorkflowID,
+			ExecutionBundle: alt.ExecutionBundle,
+			Confidence:      alt.Confidence,
+			Rationale:       alt.Rationale,
+		})
+	}
+	analysis.Status.EnsureRCAResult().AlternativeWorkflows = alternatives
+}
+
+// mapAlignmentVerdict maps the alignment verdict from AgentSessionResult to
+// the AIAnalysisStatus CRD. Called for ALL response paths so aligned
+// verdicts are also recorded. No-op when AlignmentVerdict is absent.
+func (p *ResponseProcessor) mapAlignmentVerdict(analysis *aianalysisv1.AIAnalysis, res *agentsessionv1.AgentSessionResult) {
+	av := res.AlignmentVerdict
+	if av == nil {
+		return
+	}
+	status := &aianalysisv1.AlignmentVerdictStatus{
+		Result:                  av.Result,
+		CircuitBreakerActivated: av.CircuitBreakerActivated,
+		Summary:                 av.Summary,
+		Flagged:                 av.Flagged,
+		Total:                   av.Total,
+	}
+	for _, f := range av.Findings {
+		status.Findings = append(status.Findings, aianalysisv1.AlignmentFindingStatus{
+			StepIndex:   f.StepIndex,
+			StepKind:    f.StepKind,
+			Tool:        f.Tool,
+			Explanation: f.Explanation,
+		})
+	}
+	analysis.Status.EnsureReview().AlignmentVerdict = status
+}
+
+// populatePostRCAContext extracts detected_labels from the KA response raw
+// JSON and sets PostRCAContext on the AIAnalysis status.
+// ADR-056: DetectedLabels flow from KA → PostRCAContext for Rego policy input.
+func (p *ResponseProcessor) populatePostRCAContext(analysis *aianalysisv1.AIAnalysis, detectedLabels *apiextensionsv1.JSON) {
+	dlMap := mapFromAgentSessionJSON(detectedLabels)
+	if len(dlMap) == 0 {
+		return
+	}
+
+	dl := extractDetectedLabels(dlMap)
+	now := metav1.Now()
+	analysis.Status.PostRCAContext = &aianalysisv1.PostRCAContext{
+		DetectedLabels: dl,
+		SetAt:          &now,
+	}
+
+	p.log.Info("Populated PostRCAContext from KA detected_labels",
+		"gitOpsManaged", dl.GitOpsManaged,
+		"stateful", dl.Stateful,
+		"failedDetections", dl.FailedDetections,
+	)
+}
+
+// extractDetectedLabels converts a raw map from the KA response into the
+// strongly-typed DetectedLabels struct. Fields not present default to zero values.
+func extractDetectedLabels(m map[string]interface{}) *sharedtypes.DetectedLabels {
+	return &sharedtypes.DetectedLabels{
+		GitOpsManaged:            GetBoolFromMap(m, "gitOpsManaged"),
+		GitOpsTool:               GetStringFromMap(m, "gitOpsTool"),
+		PDBProtected:             GetBoolFromMap(m, "pdbProtected"),
+		HPAEnabled:               GetBoolFromMap(m, "hpaEnabled"),
+		Stateful:                 GetBoolFromMap(m, "stateful"),
+		HelmManaged:              GetBoolFromMap(m, "helmManaged"),
+		NetworkIsolated:          GetBoolFromMap(m, "networkIsolated"),
+		ServiceMesh:              GetStringFromMap(m, "serviceMesh"),
+		ResourceQuotaConstrained: GetBoolFromMap(m, "resourceQuotaConstrained"),
+		VirtualMachine:           GetBoolFromMap(m, "virtualMachine"),
+		LiveMigratable:           GetBoolFromMap(m, "liveMigratable"),
+		CDIManaged:               GetBoolFromMap(m, "cdiManaged"),
+		StorageBackend:           GetStringFromMap(m, "storageBackend"),
+		FailedDetections:         GetStringSliceFromMap(m, "failedDetections"),
+	}
+}
+
+// handleWorkflowResolutionFailureFromIncident handles workflow resolution failure from AgentSessionResult
+// BR-KA-197: Workflow resolution failed, human must intervene
+// #768: Delegates to handleNoMatchingWorkflowsCompleted when humanReviewReason=no_matching_workflows
+func (p *ResponseProcessor) handleWorkflowResolutionFailureFromIncident(ctx context.Context, analysis *aianalysisv1.AIAnalysis, res *agentsessionv1.AgentSessionResult) (ctrl.Result, error) {
+	humanReviewReason := res.HumanReviewReason
+
+	// #768: no_matching_workflows is a successful investigation — route to Completed handler
+	if humanReviewReason == aianalysisv1.HumanReviewReasonNoMatchingWorkflows {
+		return p.handleNoMatchingWorkflowsCompleted(ctx, analysis, res)
+	}
+
+	hasSelectedWorkflow := res.SelectedWorkflow != nil
+
+	p.log.Info("Workflow resolution failed, requires human review",
+		"warnings", res.Warnings,
+		"humanReviewReason", humanReviewReason,
+		"hasPartialWorkflow", hasSelectedWorkflow,
+	)
+
+	p.applyWorkflowResolutionFailureState(ctx, analysis, res, humanReviewReason)
+
+	// Handle ValidationAttemptsHistory. Issue #588: Message contains only
+	// validation attempt errors. Warnings are stored separately in
+	// Status.Warnings to prevent duplication when buildManualReviewBody
+	// renders both Details and Warnings sections.
+	messageParts := recordValidationAttemptsHistory(analysis, res.ValidationAttemptsHistory)
+	analysis.Status.Message = strings.Join(messageParts, "; ")
+	analysis.Status.EnsureInvestigationMetadata().Warnings = res.Warnings
+
+	// Preserve partial response if available
+	if hasSelectedWorkflow {
+		preservePartialSelectedWorkflow(analysis, res)
+	}
+
+	// Preserve RCA if available - Issue #97: uses centralized helper with remediationTarget
+	if rca := ExtractRootCauseAnalysis(res.RootCauseAnalysis); rca != nil {
+		analysis.Status.EnsureRCAResult().RootCauseAnalysis = rca
+	}
+
+	aianalysis.SetInvestigationComplete(analysis, false, fmt.Sprintf("workflow resolution failed: %s", humanReviewReason))
+	aianalysis.SetAnalysisComplete(analysis, false, fmt.Sprintf("workflow resolution failed: %s", humanReviewReason))
+	aianalysis.SetWorkflowResolved(analysis, false, aianalysis.ReasonWorkflowResolutionFailed, "Workflow resolution failed, requires human review")
+	aianalysis.SetApprovalRequired(analysis, false, "NotApplicable", "No resolved workflow, approval not applicable")
+	return ctrl.Result{}, nil // Terminal - no requeue
+}
+
+// applyWorkflowResolutionFailureState sets the CRD status fields, records
+// failure metrics, emits the audit event, and maps the SubReason for a
+// workflow-resolution failure.
+func (p *ResponseProcessor) applyWorkflowResolutionFailureState(ctx context.Context, analysis *aianalysisv1.AIAnalysis, res *agentsessionv1.AgentSessionResult, humanReviewReason string) {
+	// Set structured failure with timestamp
+	now := metav1.Now()
+	analysis.Status.Phase = aianalysis.PhaseFailed
+	analysis.Status.ObservedGeneration = analysis.Generation // DD-CONTROLLER-001
+	analysis.Status.CompletedAt = &now
+	setTotalAnalysisTime(analysis, now)
+	analysis.Status.Reason = aianalysisv1.ReasonWorkflowResolutionFailed
+	analysis.Status.EnsureInvestigationMetadata().InvestigationID = res.IncidentID
+
+	// BR-KA-197: Store human review flag and reason in CRD status
+	review := analysis.Status.EnsureReview()
+	review.NeedsHumanReview = true
+	if humanReviewReason != "" {
+		review.HumanReviewReason = humanReviewReason
+	}
+
+	// BR-KA-197: Track failure metrics
+	p.metrics.FailuresTotal.WithLabelValues("WorkflowResolutionFailed", "NoWorkflowResolved").Inc()
+
+	// Record failure metric
+	subReason := "HumanReviewRequired"
+	if humanReviewReason != "" {
+		subReason = humanReviewReason
+	}
+	p.metrics.RecordFailure("WorkflowResolutionFailed", subReason)
+
+	// DD-AUDIT-003: Record analysis failure audit event
+	failureErr := fmt.Errorf("workflow resolution failed: %s", humanReviewReason)
+	if auditErr := p.auditClient.RecordAnalysisFailed(ctx, analysis, failureErr); auditErr != nil {
+		p.log.V(1).Info("Failed to record analysis failure audit", "error", auditErr)
+	}
+
+	// Map HumanReviewReason enum to SubReason
+	if humanReviewReason != "" {
+		analysis.Status.SubReason = p.mapEnumToSubReason(humanReviewReason)
+	} else {
+		analysis.Status.SubReason = mapWarningsToSubReason(res.Warnings)
+	}
+}
+
+// recordValidationAttemptsHistory converts the KA response's
+// ValidationAttemptsHistory entries into CRD ValidationAttempt records,
+// appending them to analysis.Status.ValidationAttemptsHistory, and returns
+// an operator-friendly message fragment per attempt that had errors.
+func recordValidationAttemptsHistory(analysis *aianalysisv1.AIAnalysis, resAttempts []agentsessionv1.AgentSessionValidationAttempt) []string {
+	var messageParts []string
+	for _, resAttempt := range resAttempts {
+		attempt := aianalysisv1.ValidationAttempt{
+			Attempt:    resAttempt.Attempt,
+			WorkflowID: resAttempt.WorkflowID,
+			IsValid:    resAttempt.IsValid,
+			Errors:     resAttempt.Errors,
+		}
+		// Parse timestamp string to metav1.Time
+		if parsedTime, err := time.Parse(time.RFC3339, resAttempt.Timestamp); err == nil {
+			attempt.Timestamp = metav1.NewTime(parsedTime)
+		} else {
+			// Fallback to current time if parsing fails
+			attempt.Timestamp = metav1.Now()
+		}
+		im := analysis.Status.EnsureInvestigationMetadata()
+		im.ValidationAttemptsHistory = append(im.ValidationAttemptsHistory, attempt)
+
+		// Build operator-friendly message from validation attempts
+		if len(resAttempt.Errors) > 0 {
+			messageParts = append(messageParts, fmt.Sprintf("Attempt %d: %s", resAttempt.Attempt, strings.Join(resAttempt.Errors, ", ")))
+		}
+	}
+	return messageParts
+}
+
+// preservePartialSelectedWorkflow stores the KA response's partial
+// selected_workflow (when present) on a failed-resolution analysis, so
+// operators retain visibility into what KA was considering.
+func preservePartialSelectedWorkflow(analysis *aianalysisv1.AIAnalysis, res *agentsessionv1.AgentSessionResult) {
+	swMap := mapFromAgentSessionJSON(res.SelectedWorkflow)
+	if swMap == nil {
+		return
+	}
+	sw := &aianalysisv1.SelectedWorkflow{
+		WorkflowSnapshot: sharedtypes.WorkflowSnapshot{
+			WorkflowID:         GetStringFromMap(swMap, "workflow_id"),
+			WorkflowName:       GetStringFromMap(swMap, "workflow_name"),
+			ActionType:         GetStringFromMap(swMap, "action_type"),
+			ExecutionBundle:    GetStringFromMap(swMap, "execution_bundle"),
+			ExecutionEngine:    GetStringFromMap(swMap, "execution_engine"),
+			ServiceAccountName: GetStringFromMap(swMap, "service_account_name"),
+			ExecutionClusterID: GetStringFromMap(swMap, "execution_cluster_id"),
+		},
+		Confidence: GetFloat64FromMap(swMap, "confidence"),
+		Rationale:  GetStringFromMap(swMap, "rationale"),
+	}
+	stampWorkflowSnapshot(sw, swMap)
+	analysis.Status.EnsureRCAResult().SelectedWorkflow = sw
+}
+
+// handleProblemResolvedFromIncident handles problem self-resolved from AgentSessionResult
+// BR-KA-200: Problem confirmed resolved, no workflow needed
+//
+//nolint:unparam // ctrl.Result is always the zero value here; signature matches the shared dispatch contract of sibling handleXFromIncident functions (handleNotActionableFromIncident, handleNoWorkflowTerminalFailure), called uniformly as `result, err := p.handleXFromIncident(...)` (Issue #1546 Tier 4)
+func (p *ResponseProcessor) handleProblemResolvedFromIncident(ctx context.Context, analysis *aianalysisv1.AIAnalysis, res *agentsessionv1.AgentSessionResult) (ctrl.Result, error) {
+	p.log.Info("Problem confirmed resolved, no workflow needed",
+		"confidence", res.Confidence,
+		"warnings", res.Warnings,
+	)
+
+	now := metav1.Now()
+	analysis.Status.Phase = aianalysis.PhaseCompleted
+	analysis.Status.ObservedGeneration = analysis.Generation // DD-CONTROLLER-001
+	analysis.Status.CompletedAt = &now
+	setTotalAnalysisTime(analysis, now)
+	analysis.Status.Reason = aianalysisv1.ReasonWorkflowNotNeeded
+	analysis.Status.SubReason = aianalysisv1.SubReasonProblemResolved
+	analysis.Status.EnsureInvestigationMetadata().InvestigationID = res.IncidentID
+
+	// BR-KA-197: No human review needed for resolved problems
+	analysis.Status.EnsureReview().NeedsHumanReview = false
+
+	switch {
+	case res.Analysis != "":
+		analysis.Status.Message = res.Analysis
+	case len(res.Warnings) > 0:
+		analysis.Status.Message = strings.Join(res.Warnings, "; ")
+	default:
+		analysis.Status.Message = "Problem self-resolved. No remediation required."
+	}
+
+	analysis.Status.EnsureInvestigationMetadata().Warnings = res.Warnings
+
+	// Store RCA if available - Issue #97: uses centralized helper with remediationTarget
+	if rca := ExtractRootCauseAnalysis(res.RootCauseAnalysis); rca != nil {
+		analysis.Status.EnsureRCAResult().RootCauseAnalysis = rca
+	}
+
+	aianalysis.SetInvestigationComplete(analysis, true, "Investigation completed: problem self-resolved")
+	aianalysis.SetAnalysisComplete(analysis, true, "Analysis completed: no workflow needed, problem resolved")
+	aianalysis.SetWorkflowResolved(analysis, false, aianalysis.ReasonNoWorkflowNeeded, "Problem self-resolved, no workflow needed")
+	aianalysis.SetApprovalRequired(analysis, false, "NotApplicable", "No workflow selected, approval not applicable")
+
+	// BR-KA-200: Record analysis completion audit event
+	// This is a successful completion even though no workflow was selected
+	p.auditClient.RecordAnalysisComplete(ctx, analysis)
+
+	return ctrl.Result{}, nil
+}
+
+// handleNotActionableFromIncident handles alert-not-actionable outcomes from AgentSessionResult.
+// #388: Alert is benign — condition may be present but is harmless (e.g., orphaned PVCs).
+// Routes to Completed/WorkflowNotNeeded/NotActionable, analogous to handleProblemResolvedFromIncident
+// but semantically distinct: resolved = problem went away, not-actionable = problem is harmless.
+//
+//nolint:unparam // ctrl.Result is always the zero value here; signature matches the shared dispatch contract of sibling handleXFromIncident functions (see handleProblemResolvedFromIncident) (Issue #1546 Tier 4)
+func (p *ResponseProcessor) handleNotActionableFromIncident(ctx context.Context, analysis *aianalysisv1.AIAnalysis, res *agentsessionv1.AgentSessionResult) (ctrl.Result, error) {
+	p.log.Info("Alert not actionable, no workflow needed",
+		"confidence", res.Confidence,
+		"warnings", res.Warnings,
+	)
+
+	now := metav1.Now()
+	analysis.Status.Phase = aianalysis.PhaseCompleted
+	analysis.Status.ObservedGeneration = analysis.Generation // DD-CONTROLLER-001
+	analysis.Status.CompletedAt = &now
+	setTotalAnalysisTime(analysis, now)
+	analysis.Status.Reason = aianalysisv1.ReasonWorkflowNotNeeded
+	analysis.Status.SubReason = "NotActionable"
+	analysis.Status.EnsureInvestigationMetadata().InvestigationID = res.IncidentID
+
+	// #388: Benign alerts never require human review
+	analysis.Status.EnsureReview().NeedsHumanReview = false
+	analysis.Status.EnsureRCAResult().Actionability = aianalysis.ActionabilityNotActionable
+
+	switch {
+	case res.Analysis != "":
+		analysis.Status.Message = res.Analysis
+	case len(res.Warnings) > 0:
+		analysis.Status.Message = strings.Join(res.Warnings, "; ")
+	default:
+		analysis.Status.Message = "Alert not actionable. No remediation warranted."
+	}
+
+	analysis.Status.EnsureInvestigationMetadata().Warnings = res.Warnings
+
+	// Store RCA for audit trail — benign conditions still warrant documentation
+	if rca := ExtractRootCauseAnalysis(res.RootCauseAnalysis); rca != nil {
+		analysis.Status.EnsureRCAResult().RootCauseAnalysis = rca
+	}
+
+	aianalysis.SetInvestigationComplete(analysis, true, "Investigation completed: alert not actionable")
+	aianalysis.SetAnalysisComplete(analysis, true, "Analysis completed: no workflow needed, alert not actionable")
+	aianalysis.SetWorkflowResolved(analysis, false, aianalysis.ReasonNoWorkflowNeeded, "Alert not actionable, no workflow needed")
+	aianalysis.SetApprovalRequired(analysis, false, "NotApplicable", "No workflow selected, approval not applicable")
+
+	p.auditClient.RecordAnalysisComplete(ctx, analysis)
+
+	return ctrl.Result{}, nil
+}
+
+// handleNoMatchingWorkflowsCompleted handles the case where the investigation succeeded
+// but no workflow matched the incident. This is Phase=Completed (not Failed) because the
+// analysis was successful — it correctly concluded that no automated remediation is available.
+//
+// Issue #768: Phase should be Completed when humanReviewReason=no_matching_workflows
+// Issue #769: rootCauseAnalysis must be preserved (rootCause must be populated)
+func (p *ResponseProcessor) handleNoMatchingWorkflowsCompleted(ctx context.Context, analysis *aianalysisv1.AIAnalysis, res *agentsessionv1.AgentSessionResult) (ctrl.Result, error) {
+	humanReviewReason := res.HumanReviewReason
+
+	p.log.Info("Investigation succeeded, no matching workflows — completing with human review",
+		"confidence", res.Confidence,
+		"humanReviewReason", humanReviewReason,
+		"warnings", res.Warnings,
+	)
+
+	now := metav1.Now()
+	analysis.Status.Phase = aianalysis.PhaseCompleted
+	analysis.Status.ObservedGeneration = analysis.Generation
+	analysis.Status.CompletedAt = &now
+	setTotalAnalysisTime(analysis, now)
+	analysis.Status.Reason = aianalysisv1.ReasonAnalysisCompleted
+	analysis.Status.SubReason = aianalysisv1.SubReasonNoMatchingWorkflows
+	analysis.Status.EnsureInvestigationMetadata().InvestigationID = res.IncidentID
+
+	// #768: NeedsHumanReview remains true — still requires human intervention
+	review := analysis.Status.EnsureReview()
+	review.NeedsHumanReview = true
+	if humanReviewReason != "" {
+		review.HumanReviewReason = humanReviewReason
+	}
+
+	// Build operator-friendly message
+	analysis.Status.Message = "Investigation completed: no matching workflows found"
+	if len(res.Warnings) > 0 {
+		analysis.Status.Message += "; " + strings.Join(res.Warnings, "; ")
+	}
+	analysis.Status.EnsureInvestigationMetadata().Warnings = res.Warnings
+
+	// #769: Preserve RCA — both rootCause (summary) and rootCauseAnalysis (full struct)
+	if rca := ExtractRootCauseAnalysis(res.RootCauseAnalysis); rca != nil {
+		rcaResult := analysis.Status.EnsureRCAResult()
+		rcaResult.RootCause = rca.Summary
+		rcaResult.RootCauseAnalysis = rca
+	}
+
+	// #768: Conditions reflect successful investigation, no workflow match
+	aianalysis.SetInvestigationComplete(analysis, true, "Investigation completed successfully")
+	aianalysis.SetAnalysisComplete(analysis, true, "Analysis completed: no matching workflows found")
+	aianalysis.SetWorkflowResolved(analysis, false, aianalysis.ReasonNoMatchingWorkflows, "No matching workflows found, human review required")
+	aianalysis.SetApprovalRequired(analysis, false, "NotApplicable", "No workflow selected, approval not applicable")
+
+	// #768: Audit as completion (not failure) — this also feeds RR reconstruction
+	p.auditClient.RecordAnalysisComplete(ctx, analysis)
+
+	return ctrl.Result{}, nil
+}
+
+// handleNoWorkflowTerminalFailure handles terminal failure when no workflow selected with low confidence
+// Issue #29: BR-AI-050 - AIAnalysis must detect terminal failure per BR-KA-197 AC-4
+//
+//nolint:unparam // ctrl.Result is always the zero value here; signature matches the shared dispatch contract of sibling handleXFromIncident functions (see handleProblemResolvedFromIncident) (Issue #1546 Tier 4)
+func (p *ResponseProcessor) handleNoWorkflowTerminalFailure(ctx context.Context, analysis *aianalysisv1.AIAnalysis, res *agentsessionv1.AgentSessionResult) (ctrl.Result, error) {
+	p.log.Info("No workflow selected, terminal failure",
+		"confidence", res.Confidence,
+		"warnings", res.Warnings,
+	)
+
+	// Set structured failure with timestamp
+	now := metav1.Now()
+	analysis.Status.Phase = aianalysis.PhaseFailed
+	analysis.Status.ObservedGeneration = analysis.Generation // DD-CONTROLLER-001
+	analysis.Status.CompletedAt = &now
+	setTotalAnalysisTime(analysis, now)
+	analysis.Status.Reason = aianalysis.ReasonWorkflowResolutionFailed
+	analysis.Status.SubReason = aianalysisv1.SubReasonNoMatchingWorkflows // Maps to CRD SubReason enum
+	analysis.Status.EnsureInvestigationMetadata().InvestigationID = res.IncidentID
+
+	// BR-KA-197 AC-4: AIAnalysis sets needs_human_review for terminal failures
+	review := analysis.Status.EnsureReview()
+	review.NeedsHumanReview = true
+	review.HumanReviewReason = aianalysisv1.HumanReviewReasonNoMatchingWorkflows
+
+	// Build operator-friendly message
+	analysis.Status.Message = "No workflow selected for remediation"
+	if len(res.Warnings) > 0 {
+		analysis.Status.Message += "; " + strings.Join(res.Warnings, "; ")
+	}
+	analysis.Status.EnsureInvestigationMetadata().Warnings = res.Warnings
+
+	// Store RCA if available (for human review context) - Issue #97: centralized helper
+	if rca := ExtractRootCauseAnalysis(res.RootCauseAnalysis); rca != nil {
+		analysis.Status.EnsureRCAResult().RootCauseAnalysis = rca
+	}
+
+	// BR-AI-050: Emit audit event for terminal failure
+	failureErr := fmt.Errorf("no workflow selected: no matching workflows found")
+	if auditErr := p.auditClient.RecordAnalysisFailed(ctx, analysis, failureErr); auditErr != nil {
+		p.log.V(1).Info("Failed to record analysis failure audit", "error", auditErr)
+	}
+
+	// Track failure metrics
+	p.metrics.FailuresTotal.WithLabelValues("WorkflowResolutionFailed", aianalysisv1.SubReasonNoMatchingWorkflows).Inc()
+	p.metrics.RecordFailure("WorkflowResolutionFailed", aianalysisv1.SubReasonNoMatchingWorkflows)
+
+	aianalysis.SetInvestigationComplete(analysis, false, "no workflow selected: no matching workflows found")
+	aianalysis.SetAnalysisComplete(analysis, false, "No workflow selected for remediation")
+	aianalysis.SetWorkflowResolved(analysis, false, aianalysis.ReasonWorkflowResolutionFailed, "No matching workflows found")
+	aianalysis.SetApprovalRequired(analysis, false, "NotApplicable", "No workflow selected, approval not applicable")
+	return ctrl.Result{}, nil // Terminal - no requeue
+}
+
+// handleLowConfidenceFailure handles workflow selection with confidence below threshold
+// Issue #28: BR-KA-197 AC-4 - AIAnalysis applies confidence threshold (not KA)
+func (p *ResponseProcessor) handleLowConfidenceFailure(ctx context.Context, analysis *aianalysisv1.AIAnalysis, res *agentsessionv1.AgentSessionResult) (ctrl.Result, error) {
+	// BR-AI-088.4 / Issue #1828: operator-configurable via WithLowConfidenceFloor (V1.0: 70% default)
+	confidenceThreshold := p.effectiveLowConfidenceFloor()
+
+	p.log.Info("Low confidence workflow, requires human review",
+		"confidence", res.Confidence,
+		"threshold", confidenceThreshold,
+		"warnings", res.Warnings,
+	)
+
+	// Set structured failure with timestamp
+	now := metav1.Now()
+	analysis.Status.Phase = aianalysis.PhaseFailed
+	analysis.Status.ObservedGeneration = analysis.Generation // DD-CONTROLLER-001
+	analysis.Status.CompletedAt = &now
+	setTotalAnalysisTime(analysis, now)
+	analysis.Status.Reason = aianalysis.ReasonWorkflowResolutionFailed
+	analysis.Status.SubReason = aianalysisv1.SubReasonLowConfidence // Maps to CRD SubReason enum
+	analysis.Status.EnsureInvestigationMetadata().InvestigationID = res.IncidentID
+
+	// BR-KA-197 AC-4: AIAnalysis sets needs_human_review for low confidence
+	review := analysis.Status.EnsureReview()
+	review.NeedsHumanReview = true
+	review.HumanReviewReason = aianalysisv1.HumanReviewReasonLowConfidence
+
+	// Build operator-friendly message
+	analysis.Status.Message = fmt.Sprintf("Workflow confidence %.2f below threshold %.2f (low_confidence)", res.Confidence, confidenceThreshold)
+	if len(res.Warnings) > 0 {
+		analysis.Status.Message += "; " + strings.Join(res.Warnings, "; ")
+	}
+	analysis.Status.EnsureInvestigationMetadata().Warnings = res.Warnings
+
+	// Store workflow info for human review (partial information for operator context)
+	if res.SelectedWorkflow != nil {
+		preserveLowConfidenceWorkflow(analysis, res)
+	}
+
+	// Store RCA if available (for human review context) - Issue #97: centralized helper
+	if rca := ExtractRootCauseAnalysis(res.RootCauseAnalysis); rca != nil {
+		analysis.Status.EnsureRCAResult().RootCauseAnalysis = rca
+	}
+
+	// Store alternative workflows if available (for human review context)
+	storeAlternativeWorkflows(analysis, res)
+
+	// BR-AI-050: Emit audit event for low confidence failure
+	failureErr := fmt.Errorf("low confidence: %.2f below threshold %.2f", res.Confidence, confidenceThreshold)
+	if auditErr := p.auditClient.RecordAnalysisFailed(ctx, analysis, failureErr); auditErr != nil {
+		p.log.V(1).Info("Failed to record analysis failure audit", "error", auditErr)
+	}
+
+	// Track failure metrics
+	p.metrics.FailuresTotal.WithLabelValues(string(aianalysisv1.ReasonWorkflowResolutionFailed), aianalysisv1.SubReasonLowConfidence).Inc()
+	p.metrics.RecordFailure(string(aianalysisv1.ReasonWorkflowResolutionFailed), aianalysisv1.SubReasonLowConfidence)
+
+	aianalysis.SetInvestigationComplete(analysis, false, fmt.Sprintf("low confidence: %.2f below threshold %.2f", res.Confidence, confidenceThreshold))
+	aianalysis.SetAnalysisComplete(analysis, false, fmt.Sprintf("Workflow confidence %.2f below threshold %.2f", res.Confidence, confidenceThreshold))
+	aianalysis.SetWorkflowResolved(analysis, false, aianalysis.ReasonWorkflowResolutionFailed, fmt.Sprintf("Workflow confidence %.2f below threshold", res.Confidence))
+	aianalysis.SetApprovalRequired(analysis, false, "NotApplicable", "Workflow not approved due to low confidence")
+	return ctrl.Result{}, nil // Terminal - no requeue
+}
+
+// preserveLowConfidenceWorkflow stores the KA response's selected_workflow
+// (partial information, for operator/human-review context) on a
+// low-confidence-failed analysis.
+func preserveLowConfidenceWorkflow(analysis *aianalysisv1.AIAnalysis, res *agentsessionv1.AgentSessionResult) {
+	swMap := mapFromAgentSessionJSON(res.SelectedWorkflow)
+	if swMap == nil {
+		return
+	}
+	sw := &aianalysisv1.SelectedWorkflow{
+		WorkflowSnapshot: sharedtypes.WorkflowSnapshot{
+			WorkflowID:            GetStringFromMap(swMap, "workflow_id"),
+			WorkflowName:          GetStringFromMap(swMap, "workflow_name"),
+			ActionType:            GetStringFromMap(swMap, "action_type"),
+			Version:               GetStringFromMap(swMap, "version"),
+			ExecutionBundle:       GetStringFromMap(swMap, "execution_bundle"),
+			ExecutionBundleDigest: GetStringFromMap(swMap, "execution_bundle_digest"),
+			ExecutionEngine:       GetStringFromMap(swMap, "execution_engine"),
+			ServiceAccountName:    GetStringFromMap(swMap, "service_account_name"),
+			ExecutionClusterID:    GetStringFromMap(swMap, "execution_cluster_id"),
+		},
+		Confidence: GetFloat64FromMap(swMap, "confidence"),
+		Rationale:  GetStringFromMap(swMap, "rationale"),
+	}
+	// Map parameters if present
+	if paramsRaw, ok := swMap["parameters"]; ok {
+		if paramsMapIface, ok := paramsRaw.(map[string]interface{}); ok {
+			sw.Parameters = convertMapToStringMap(paramsMapIface)
+		}
+	}
+	stampWorkflowSnapshot(sw, swMap)
+	analysis.Status.EnsureRCAResult().SelectedWorkflow = sw
+}
+
+// setTotalAnalysisTime calculates and sets TotalAnalysisTime from StartedAt.
+// Uses milliseconds to avoid truncation for sub-second analyses.
+// Safe to call when StartedAt is nil (no-op).
+func setTotalAnalysisTime(analysis *aianalysisv1.AIAnalysis, now metav1.Time) {
+	if analysis.Status.StartedAt != nil {
+		analysis.Status.EnsureInvestigationMetadata().TotalAnalysisTime = now.Sub(analysis.Status.StartedAt.Time).Milliseconds()
+	}
+}
+
+// mapEnumToSubReason maps KA HumanReviewReason enum to CRD SubReason
+// This is the preferred method - direct enum-to-enum mapping (Dec 6, 2025)
+// Updated Dec 7, 2025: Added investigation_inconclusive per BR-KA-200
+func (p *ResponseProcessor) mapEnumToSubReason(reason string) string {
+	mapping := map[string]string{
+		"workflow_not_found":                              aianalysisv1.SubReasonWorkflowNotFound,
+		"image_mismatch":                                  "ImageMismatch",
+		"parameter_validation_failed":                     "ParameterValidationFailed",
+		aianalysisv1.HumanReviewReasonNoMatchingWorkflows: aianalysisv1.SubReasonNoMatchingWorkflows,
+		aianalysisv1.HumanReviewReasonLowConfidence:       aianalysisv1.SubReasonLowConfidence,
+		"llm_parsing_error":                               "LLMParsingError",
+		"investigation_inconclusive":                      "InvestigationInconclusive", // BR-KA-200
+		aianalysisv1.HumanReviewReasonRCAIncomplete:       "RcaIncomplete",             // BR-496 v2: root_owner missing from session_state
+		"operator_escalation":                             "OperatorEscalation",        // #1449: KA complete_no_action escalation
+		"decision_expired":                                "DecisionExpired",           // #2019/#2020: presented decision expired via inactivity timeout
+	}
+	if subReason, ok := mapping[reason]; ok {
+		return subReason
+	}
+	p.log.Info("Unknown human_review_reason, defaulting to WorkflowNotFound", "reason", reason)
+	return aianalysisv1.SubReasonWorkflowNotFound
+}
+
+// hasNoWorkflowWarningSignal checks if KA's warnings contain signals that indicate
+// the absence of a selected workflow is due to an active problem (inconclusive investigation
+// or no matching workflows in the catalog), NOT because the problem self-resolved.
+//
+// This is a defense-in-depth check (Layer 2) for BR-KA-200.6. It catches edge cases
+// where the LLM incorrectly sets needs_human_review=false but KA's result_parser
+// still appends diagnostic warnings from investigation_outcome processing.
+//
+// Warning signals checked (from KA result_parser.py):
+//   - "inconclusive": investigation_outcome == "inconclusive"
+//   - "no workflows matched": selected_workflow is None and outcome is not "resolved"
+//   - "human review recommended": general KA safety signal
+func hasNoWorkflowWarningSignal(warnings []string) bool {
+	for _, w := range warnings {
+		lower := strings.ToLower(w)
+		if strings.Contains(lower, "inconclusive") ||
+			strings.Contains(lower, "no workflows matched") ||
+			strings.Contains(lower, "human review recommended") {
+			return true
+		}
+	}
+	return false
+}
+
+// hasProblemResolvedSignal checks if KA emitted the "Problem self-resolved" warning.
+// This warning is only produced when investigation_outcome == "resolved" (result_parser.py),
+// making it an authoritative signal that the problem is no longer occurring.
+// #301: Used to bypass hasSubstantiveRCA when the RCA documents a resolved transient
+// condition rather than an active problem.
+func hasProblemResolvedSignal(warnings []string) bool {
+	for _, w := range warnings {
+		if strings.Contains(strings.ToLower(w), "problem self-resolved") {
+			return true
+		}
+	}
+	return false
+}
+
+// hasNotActionableSignal checks if KA emitted the "Alert not actionable" warning.
+// This warning is only produced when actionable == false (result_parser.py),
+// making it an authoritative signal that the alert is benign.
+// #388: Used to route to Completed/WorkflowNotNeeded/NotActionable, bypassing
+// the hasSubstantiveRCA check — the RCA documents a benign condition for audit,
+// not an ongoing problem requiring intervention.
+func hasNotActionableSignal(warnings []string) bool {
+	for _, w := range warnings {
+		if strings.Contains(strings.ToLower(w), "alert not actionable") {
+			return true
+		}
+	}
+	return false
+}
+
+// hasSubstantiveRCA checks if the LLM response contains a root cause analysis
+// with contributing factors, indicating a real problem was identified.
+// #208: When no workflow is selected but a real problem exists, the system should
+// escalate to human review rather than silently completing as "NoActionRequired."
+func hasSubstantiveRCA(rca *apiextensionsv1.JSON) bool {
+	extracted := ExtractRootCauseAnalysis(rca)
+	if extracted == nil {
+		return false
+	}
+	return extracted.Summary != "" && len(extracted.ContributingFactors) > 0
+}
+
+// mapWarningsToSubReason extracts SubReason from KA warnings
+//
+// Deprecated: Use mapEnumToSubReason when HumanReviewReason is available.
+// Kept for backward compatibility with older KA versions.
+func mapWarningsToSubReason(warnings []string) string {
+	warningsStr := strings.ToLower(strings.Join(warnings, " "))
+
+	switch {
+	case strings.Contains(warningsStr, "not found") || strings.Contains(warningsStr, "does not exist"):
+		return aianalysisv1.SubReasonWorkflowNotFound
+	case strings.Contains(warningsStr, "no workflows matched") || strings.Contains(warningsStr, "no matching"):
+		return aianalysisv1.SubReasonNoMatchingWorkflows
+	case strings.Contains(warningsStr, "confidence") && strings.Contains(warningsStr, "below"):
+		return aianalysisv1.SubReasonLowConfidence
+	case strings.Contains(warningsStr, "parameter validation") || strings.Contains(warningsStr, "missing required"):
+		return "ParameterValidationFailed"
+	case strings.Contains(warningsStr, "image mismatch") || strings.Contains(warningsStr, "container image"):
+		return "ImageMismatch"
+	case strings.Contains(warningsStr, "parse") || strings.Contains(warningsStr, "invalid json"):
+		return "LLMParsingError"
+	default:
+		return aianalysisv1.SubReasonWorkflowNotFound // Default to most common case
+	}
+}
+
+// ExtractRootCauseAnalysis extracts RCA from an AgentSessionResult's raw-JSON
+// RootCauseAnalysis field, including remediationTarget.
+// Issue #97: Centralizes RCA extraction (was duplicated in 5 handler functions).
+// BR-496 v2: remediationTarget is KA-injected from K8s-verified root_owner, not LLM-provided.
+// #542: KA emits "remediationTarget" in JSON; CRD stores it as RemediationTarget.
+func ExtractRootCauseAnalysis(rcaData *apiextensionsv1.JSON) *aianalysisv1.RootCauseAnalysis {
+	rcaMap := mapFromAgentSessionJSON(rcaData)
+	if rcaMap == nil {
+		return nil
+	}
+	severity := GetStringFromMap(rcaMap, "severity")
+	if severity == "" {
+		severity = "unknown"
+	}
+	rca := &aianalysisv1.RootCauseAnalysis{
+		Summary:             GetStringFromMap(rcaMap, "summary"),
+		Severity:            severity,
+		SignalType:          GetStringFromMap(rcaMap, "signal_name"),
+		ContributingFactors: GetStringSliceFromMap(rcaMap, "contributing_factors"),
+	}
+
+	// #542: KA emits "remediationTarget"; maps to CRD's RemediationTarget field.
+	if arRaw, ok := rcaMap["remediationTarget"]; ok {
+		if arMap, ok := arRaw.(map[string]interface{}); ok {
+			kind, _ := arMap["kind"].(string)
+			name, _ := arMap["name"].(string)
+			ns, _ := arMap["namespace"].(string)
+			apiVersion, _ := arMap["api_version"].(string) // #1040
+			if kind != "" && name != "" {
+				rca.RemediationTarget = &aianalysisv1.RemediationTarget{
+					Kind:       kind,
+					Name:       name,
+					Namespace:  ns,
+					APIVersion: apiVersion,
+				}
+			}
+		}
+	}
+
+	return rca
+}
