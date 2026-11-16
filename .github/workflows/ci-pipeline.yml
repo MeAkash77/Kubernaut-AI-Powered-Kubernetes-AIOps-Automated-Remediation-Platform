@@ -275,7 +275,7 @@ jobs:
           submodules: true
 
       - name: Install Helm
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: latest
 
@@ -1210,7 +1210,7 @@ jobs:
           kind version
       - name: Install Helm (fleet/fleetmetadatacache-kuadrant/fleetmetadatacache-eaigw E2E deploy Istio/Kuadrant/Envoy AI Gateway via helm)
         if: matrix.service == 'fleet' || matrix.service == 'fleetmetadatacache-kuadrant' || matrix.service == 'fleetmetadatacache-eaigw'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: latest
       - name: Install Tekton CLI (tkn)
@@ -1489,7 +1489,7 @@ jobs:
           submodules: recursive
 
       - name: Install Helm
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: latest
 
@@ -2090,7 +2090,7 @@ jobs:
           kind version
 
       - name: Install Helm
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: latest
 
